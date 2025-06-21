@@ -1,4 +1,4 @@
-// --- server.js (v5 - Sheets 格式優化) ---
+// --- server.js (v6 - 格式優化與邏輯修正) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -6,7 +6,7 @@ const { Pool } = require('pg');
 const { google } = require('googleapis');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// ... 省略與 v4 相同的初始化程式碼 ...
+// ... 省略與 v5 相同的初始化程式碼 ...
 
 // *** 修改：接收訂單的端點 ***
 app.post('/api/orders', async (req, res) => {
@@ -43,10 +43,12 @@ async function appendOrderToGoogleSheet(orderData) {
   // *** 新增：格式化品項詳情的邏輯 ***
   const itemDetailsString = orderData.items.map(item => {
     const name = item.name?.zh || '未知品項';
+    // *** 這裡需要從 t.options 查找，但後端沒有 t 物件，所以直接用 value ***
     const options = item.selectedOptions ? Object.values(item.selectedOptions).join(', ') : '無';
     const notes = item.notes ? `備註: ${item.notes}` : '';
+    // 將每個品項的資訊分行顯示
     return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
-  }).join('\n\n'); // 使用兩個換行符分隔不同品項
+  }).join('\n\n'); // 使用兩個換行符分隔不同品項，在儲存格中會實現換行效果
 
   const sheets = google.sheets({ version: 'v4', auth });
   const values = [[
