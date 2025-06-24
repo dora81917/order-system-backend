@@ -1,4 +1,4 @@
-// --- server.js (最終穩定版) ---
+// --- server.js (v2 - 期間限定修復版) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -38,8 +38,20 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
+// --- 模擬多國語言翻譯 (用於 Google Sheets) ---
+const translations = {
+    zh: {
+        options: {
+            spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" },
+            sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" },
+            ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" },
+            size: { name: "份量", small: "小份", large: "大份" },
+        }
+    }
+}
+
 // --- API 端點 ---
-app.get('/', (req, res) => res.send('後端伺服器 (最終穩定版) 已成功啟動！'));
+app.get('/', (req, res) => res.send('後端伺服器 (v2 - 修正版) 已成功啟動！'));
 
 // 假設 restaurantId=1
 app.get('/api/settings', async (req, res) => {
@@ -54,7 +66,17 @@ app.get('/api/menu', async (req, res) => {
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         
-        // 修正：將 'options' 從字串轉為陣列，並確保所有項目都有此屬性
+        // *** 修正：將寫死的範例資料格式統一 ***
+        menu.limited.push({
+            id: 99,
+            name: { zh: "夏日芒果冰", en: "Summer Mango Shaved Ice", ja: "サマーマンゴーかき氷", ko: "여름 망고 빙수" },
+            price: 150,
+            image: "https://placehold.co/600x400/FFE4B5/E67E22?text=芒果冰",
+            description: { zh: "炎炎夏日，來一碗清涼消暑的芒果冰吧！", en: "Enjoy a bowl of refreshing mango shaved ice in the hot summer!"},
+            category: 'limited',
+            options: ['size'] // 確保 options 是陣列格式
+        });
+        
         const formattedItems = result.rows.map(item => ({
             ...item,
             options: item.options ? item.options.split(',').filter(opt => opt) : [] // 過濾掉空字串
@@ -89,7 +111,8 @@ app.post('/api/orders', async (req, res) => {
 
         for (const item of items) {
             const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
-            await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
+            // 注意：對於範例項目(id=99)，menu_item_id 會是 null，因為它不在 menu_items 表中
+            await client.query(orderItemInsertQuery, [newOrderId, item.id === 99 ? null : item.id, item.quantity, item.notes]);
         }
         await client.query('COMMIT');
         
