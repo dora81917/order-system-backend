@@ -17,7 +17,10 @@ const pool = new Pool({
 const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 
 function getGoogleAuth() {
-  if (!process.env.GOOGLE_CREDENTIALS_JSON) return null;
+  if (!process.env.GOOGLE_CREDENTIALS_JSON) {
+    console.log("環境變數 GOOGLE_CREDENTIALS_JSON 未設定。");
+    return null;
+  }
   try {
     const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     return new google.auth.GoogleAuth({
@@ -51,24 +54,18 @@ app.get('/api/menu', async (req, res) => {
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         
-        // 新增一個寫死的期間限定範例
-        menu.limited.push({
-            id: 99,
-            name: { zh: "夏日芒果冰", en: "Summer Mango Shaved Ice", ja: "サマーマンゴーかき氷", ko: "여름 망고 빙수" },
-            price: 150,
-            image: "https://placehold.co/600x400/FFE4B5/E67E22?text=芒果冰",
-            description: { zh: "炎炎夏日，來一碗清涼消暑的芒果冰吧！", en: "Enjoy a bowl of refreshing mango shaved ice in the hot summer!"},
-            category: 'limited',
-            options: 'size'
-        });
+        // 修正：將 'options' 從字串轉為陣列，並確保所有項目都有此屬性
+        const formattedItems = result.rows.map(item => ({
+            ...item,
+            options: item.options ? item.options.split(',').filter(opt => opt) : [] // 過濾掉空字串
+        }));
 
-        result.rows.forEach(item => {
-            const formattedItem = { ...item, options: item.options ? item.options.split(',') : [] };
+        formattedItems.forEach(item => {
             if (menu[item.category]) {
-                menu[item.category].push(formattedItem);
+                menu[item.category].push(item);
             }
         });
-
+        
         res.json(menu);
     } catch (err) {
         console.error('查詢菜單時發生錯誤', err);
@@ -92,8 +89,7 @@ app.post('/api/orders', async (req, res) => {
 
         for (const item of items) {
             const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
-            // 注意：對於範例項目(id=99)，menu_item_id 會是 null，因為它不在 menu_items 表中
-            await client.query(orderItemInsertQuery, [newOrderId, item.id === 99 ? null : item.id, item.quantity, item.notes]);
+            await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
         }
         await client.query('COMMIT');
         
