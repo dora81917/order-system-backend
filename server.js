@@ -1,4 +1,4 @@
-// --- server.js (v16 - 視覺資料更新版) ---
+// --- server.js (v16 - 最終修復版) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -15,7 +15,7 @@ const pool = new Pool({
 // --- LINE Bot Client 初始化 ---
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',
-  channelSecret: process.env.LINE_CHANNEL_SECRET || '', // 雖然只發送訊息用不到，但建議保留
+  channelSecret: process.env.LINE_CHANNEL_SECRET || '',
 };
 const lineClient = new line.Client(lineConfig);
 
@@ -39,10 +39,10 @@ const translations = {
 };
 
 // --- API 端點 ---
-app.get('/', (req, res) => res.send('後端伺服器 (v16) 已成功啟動！'));
+app.get('/', (req, res) => res.send('後端伺服器 (v16 - 最終修復版) 已成功啟動！'));
 
 app.get('/api/settings', async (req, res) => {
-    res.json({ isAiEnabled: true, saveToGoogleSheet: true });
+    res.json({ isAiEnabled: false, saveToGoogleSheet: true }); // 預設關閉 AI
 });
 
 app.get('/api/menu', async (req, res) => {
@@ -53,7 +53,7 @@ app.get('/api/menu', async (req, res) => {
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         
-        // 新增期間限定範例
+        // ** 修正：將寫死的範例資料格式統一，並使用真實圖片 **
         menu.limited.push({
             id: 99,
             name: { zh: "夏日芒果冰", en: "Summer Mango Shaved Ice", ja: "サマーマンゴーかき氷", ko: "여름 망고 빙수" },
@@ -61,7 +61,7 @@ app.get('/api/menu', async (req, res) => {
             image: "https://images.pexels.com/photos/1092730/pexels-photo-1092730.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1",
             description: { zh: "炎炎夏日，來一碗清涼消暑的芒果冰吧！", en: "Enjoy a bowl of refreshing mango shaved ice in the hot summer!"},
             category: 'limited',
-            options: ['size'] 
+            options: ['size'] // 確保 options 是陣列格式
         });
         
         const formattedItems = result.rows.map(item => ({
@@ -150,17 +150,58 @@ function formatOrderForNotification(order) {
 }
 
 async function sendLineMessage(userId, message) {
+    if(!lineClient) return;
     try {
-        await lineClient.pushMessage(userId, {
-            type: 'text',
-            text: message,
-        });
+        await lineClient.pushMessage(userId, { type: 'text', text: message });
         console.log("LINE 訊息已發送至:", userId);
     } catch (error) {
         console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error);
     }
 }
 
-// ... 此處省略其他與前一版相同的程式碼 ...
+function getGoogleAuth() {
+    if (!process.env.GOOGLE_CREDENTIALS_JSON) { return null; }
+    try {
+        const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+        return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' });
+    } catch(e) {
+        console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e);
+        return null;
+    }
+}
+
+async function appendOrderToGoogleSheet(orderData) {
+  const auth = getGoogleAuth();
+  if (!process.env.GOOGLE_SHEET_ID || !auth) {
+    console.log("未正確設定 Google Sheet ID 或憑證，跳過寫入。");
+    return;
+  }
+  
+  const t = translations['zh']; 
+  const itemDetailsString = orderData.items.map(item => {
+    const name = item.name?.zh || '未知品項';
+    const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
+        ? Object.entries(item.selectedOptions).map(([key, value]) => {
+            return t.options[key]?.[value] || value;
+        }).join(', ') 
+        : '無';
+    const notes = item.notes ? `備註: ${item.notes}` : '';
+    return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
+  }).join('\n\n');
+
+  const sheets = google.sheets({ version: 'v4', auth });
+  const values = [[
+      orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+      orderData.table, orderData.headcount, orderData.total, itemDetailsString
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: '訂單紀錄!A:F',
+    valueInputOption: 'USER_ENTERED',
+    resource: { values },
+  });
+  console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
+}
 
 app.listen(PORT, () => console.log(`後端伺服器 (v16) 正在 http://localhost:${PORT} 上運行`));
