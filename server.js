@@ -1,4 +1,4 @@
-// --- server.js (v16 - 最終修復版) ---
+// --- server.js (v17 - 最終穩定修復版) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -12,12 +12,19 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
-// --- LINE Bot Client 初始化 ---
-const lineConfig = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN || '',
-  channelSecret: process.env.LINE_CHANNEL_SECRET || '',
-};
-const lineClient = new line.Client(lineConfig);
+// --- LINE Bot Client 初始化 (修正) ---
+// 只有在環境變數存在時，才初始化 lineClient
+let lineClient = null;
+if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
+    const lineConfig = {
+      channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+      channelSecret: process.env.LINE_CHANNEL_SECRET,
+    };
+    lineClient = new line.Client(lineConfig);
+    console.log("LINE Bot Client 已成功初始化。");
+} else {
+    console.warn("警告：未提供 LINE Channel Access Token 或 Channel Secret，LINE 通知功能將被停用。");
+}
 
 
 const app = express();
@@ -39,10 +46,10 @@ const translations = {
 };
 
 // --- API 端點 ---
-app.get('/', (req, res) => res.send('後端伺服器 (v16 - 最終修復版) 已成功啟動！'));
+app.get('/', (req, res) => res.send('後端伺服器 (v17 - 最終修復版) 已成功啟動！'));
 
 app.get('/api/settings', async (req, res) => {
-    res.json({ isAiEnabled: false, saveToGoogleSheet: true }); // 預設關閉 AI
+    res.json({ isAiEnabled: false, saveToGoogleSheet: true });
 });
 
 app.get('/api/menu', async (req, res) => {
@@ -53,7 +60,7 @@ app.get('/api/menu', async (req, res) => {
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         
-        // ** 修正：將寫死的範例資料格式統一，並使用真實圖片 **
+        // 修正範例資料，確保 options 是陣列
         menu.limited.push({
             id: 99,
             name: { zh: "夏日芒果冰", en: "Summer Mango Shaved Ice", ja: "サマーマンゴーかき氷", ko: "여름 망고 빙수" },
@@ -61,7 +68,7 @@ app.get('/api/menu', async (req, res) => {
             image: "https://images.pexels.com/photos/1092730/pexels-photo-1092730.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1",
             description: { zh: "炎炎夏日，來一碗清涼消暑的芒果冰吧！", en: "Enjoy a bowl of refreshing mango shaved ice in the hot summer!"},
             category: 'limited',
-            options: ['size'] // 確保 options 是陣列格式
+            options: ['size'] 
         });
         
         const formattedItems = result.rows.map(item => ({
@@ -105,7 +112,7 @@ app.post('/api/orders', async (req, res) => {
         console.log(`訂單 #${newOrderId} 已成功儲存至資料庫。`);
         
         const notificationMessage = formatOrderForNotification({ ...req.body, orderId: newOrderId });
-        if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_USER_ID) {
+        if (lineClient && process.env.LINE_USER_ID) {
             sendLineMessage(process.env.LINE_USER_ID, notificationMessage);
         }
         
@@ -131,6 +138,7 @@ app.post('/api/orders', async (req, res) => {
     }
 });
 
+
 // --- 通知函式 ---
 function formatOrderForNotification(order) {
     let message = `🔔 新訂單通知！(單號 #${order.orderId})\n`;
@@ -150,7 +158,10 @@ function formatOrderForNotification(order) {
 }
 
 async function sendLineMessage(userId, message) {
-    if(!lineClient) return;
+    if(!lineClient) {
+        console.log("LINE Client 未初始化，跳過發送訊息。");
+        return;
+    }
     try {
         await lineClient.pushMessage(userId, { type: 'text', text: message });
         console.log("LINE 訊息已發送至:", userId);
