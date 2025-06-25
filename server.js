@@ -1,4 +1,4 @@
-// --- server.js (v17 - 最終穩定修復版) ---
+// --- server.js (v16 - 最終修復版) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -12,8 +12,7 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
-// --- LINE Bot Client 初始化 (修正) ---
-// 只有在環境變數存在時，才初始化 lineClient
+// --- LINE Bot Client 初始化 ---
 let lineClient = null;
 if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
     const lineConfig = {
@@ -26,12 +25,10 @@ if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
     console.warn("警告：未提供 LINE Channel Access Token 或 Channel Secret，LINE 通知功能將被停用。");
 }
 
-
 const app = express();
 const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
-
 
 // --- 模擬多國語言翻譯 (用於後端格式化訊息) ---
 const translations = {
@@ -46,10 +43,10 @@ const translations = {
 };
 
 // --- API 端點 ---
-app.get('/', (req, res) => res.send('後端伺服器 (v17 - 最終修復版) 已成功啟動！'));
+app.get('/', (req, res) => res.send('後端伺服器 (v16 - 最終修復版) 已成功啟動！'));
 
 app.get('/api/settings', async (req, res) => {
-    res.json({ isAiEnabled: false, saveToGoogleSheet: true });
+    res.json({ isAiEnabled: true, saveToGoogleSheet: true });
 });
 
 app.get('/api/menu', async (req, res) => {
@@ -59,17 +56,6 @@ app.get('/api/menu', async (req, res) => {
         console.log(`成功獲取 ${result.rows.length} 筆菜單項目。`);
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
-        
-        // 修正範例資料，確保 options 是陣列
-        menu.limited.push({
-            id: 99,
-            name: { zh: "夏日芒果冰", en: "Summer Mango Shaved Ice", ja: "サマーマンゴーかき氷", ko: "여름 망고 빙수" },
-            price: 150,
-            image: "https://images.pexels.com/photos/1092730/pexels-photo-1092730.jpeg?auto=compress&cs=tinysrgb&w=1260&h=750&dpr=1",
-            description: { zh: "炎炎夏日，來一碗清涼消暑的芒果冰吧！", en: "Enjoy a bowl of refreshing mango shaved ice in the hot summer!"},
-            category: 'limited',
-            options: ['size'] 
-        });
         
         const formattedItems = result.rows.map(item => ({
             ...item,
@@ -105,7 +91,7 @@ app.post('/api/orders', async (req, res) => {
 
         for (const item of items) {
             const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
-            await client.query(orderItemInsertQuery, [newOrderId, item.id === 99 ? null : item.id, item.quantity, item.notes]);
+            await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
         }
         await client.query('COMMIT');
         
