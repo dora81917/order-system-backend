@@ -1,4 +1,4 @@
-// --- server.js (v17 - 最終修復版) ---
+// --- server.js (v18 - 最終修復版) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -15,6 +15,7 @@ const pool = new Pool({
 
 // --- LINE Bot Client 初始化 (健壯性修正) ---
 let lineClient = null;
+// 檢查金鑰是否存在，這段邏輯是正確的，問題通常出在 Render 的環境變數設定
 if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
     const lineConfig = {
       channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -23,7 +24,7 @@ if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
     lineClient = new line.Client(lineConfig);
     console.log("LINE Bot Client 已成功初始化。");
 } else {
-    console.warn("警告：未提供 LINE Channel Access Token 或 Channel Secret，LINE 通知功能將被停用。");
+    console.warn("警告：未提供 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET，LINE 通知功能將被停用。請檢查您在部署平台(如 Render)上的環境變數名稱是否正確 (大小寫、底線)。");
 }
 
 // --- Gemini AI 初始化 (健壯性修正) ---
@@ -55,7 +56,7 @@ const translations = {
 };
 
 // --- API 端點 ---
-app.get('/', (req, res) => res.send('後端伺服器 (v17 - 最終修復版) 已成功啟動！'));
+app.get('/', (req, res) => res.send('後端伺服器 (v18 - 最終修復版) 已成功啟動！'));
 
 app.get('/api/settings', async (req, res) => {
     res.json({ 
@@ -70,17 +71,18 @@ app.get('/api/menu', async (req, res) => {
         const result = await pool.query('SELECT * FROM menu_items ORDER BY category, id');
         console.log(`成功獲取 ${result.rows.length} 筆菜單項目。`);
         
-        const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
-        
         const formattedItems = result.rows.map(item => ({
             ...item,
             options: item.options ? item.options.split(',').filter(opt => opt) : []
         }));
 
+        // 【修改後的邏輯】動態建立菜單分類，以恢復「主廚推薦」並提高擴充性
+        const menu = {};
         formattedItems.forEach(item => {
-            if (menu[item.category]) {
-                menu[item.category].push(item);
+            if (!menu[item.category]) {
+                menu[item.category] = [];
             }
+            menu[item.category].push(item);
         });
         
         res.json(menu);
@@ -89,6 +91,7 @@ app.get('/api/menu', async (req, res) => {
         res.status(500).send('伺服器錯誤');
     }
 });
+
 
 app.post('/api/orders', async (req, res) => {
     const { tableNumber, headcount, totalAmount, items } = req.body;
@@ -145,7 +148,7 @@ app.post('/api/recommendation', async (req, res) => {
     const { language, cartItems, availableItems } = req.body;
     if (!cartItems || !availableItems) return res.status(400).json({ error: "缺少推薦所需的欄位" });
     
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); // 使用更新的 Flash 模型
     const prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
     
     try {
@@ -234,4 +237,4 @@ async function appendOrderToGoogleSheet(orderData) {
   console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
 }
 
-app.listen(PORT, () => console.log(`後端伺服器 (v17 - 最終修復版) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v18 - 最終修復版) 正在 http://localhost:${PORT} 上運行`));
