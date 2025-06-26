@@ -1,4 +1,3 @@
-// --- server.js (v18 - 最終修復版) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -9,25 +8,22 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- 資料庫連線設定 ---
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
-// --- LINE Bot Client 初始化 (健壯性修正) ---
+// --- 服務初始化 ---
 let lineClient = null;
-// 檢查金鑰是否存在，這段邏輯是正確的，問題通常出在 Render 的環境變數設定
 if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
-    const lineConfig = {
+    lineClient = new line.Client({
       channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
       channelSecret: process.env.LINE_CHANNEL_SECRET,
-    };
-    lineClient = new line.Client(lineConfig);
+    });
     console.log("LINE Bot Client 已成功初始化。");
 } else {
-    console.warn("警告：未提供 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET，LINE 通知功能將被停用。請檢查您在部署平台(如 Render)上的環境變數名稱是否正確 (大小寫、底線)。");
+    console.warn("警告：未提供 LINE Bot 金鑰，通知功能將被停用。");
 }
 
-// --- Gemini AI 初始化 (健壯性修正) ---
 let genAI = null;
 if(process.env.GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -36,14 +32,11 @@ if(process.env.GEMINI_API_KEY) {
     console.warn("警告：未提供 GEMINI_API_KEY，AI 推薦功能將被停用。");
 }
 
-
 const app = express();
-const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-
-// --- 模擬多國語言翻譯 (用於後端格式化訊息) ---
+// --- 輔助函式 ---
 const translations = {
   zh: {
     options: {
@@ -54,37 +47,84 @@ const translations = {
     },
   },
 };
-
-// --- API 端點 ---
-app.get('/', (req, res) => res.send('後端伺服器 (v18 - 最終修復版) 已成功啟動！'));
-
-app.get('/api/settings', async (req, res) => {
-    res.json({ 
-        isAiEnabled: !!genAI, // 如果 genAI 初始化成功，則啟用 AI 功能
-        saveToGoogleSheet: true 
+function formatOrderForNotification(order) {
+    let message = `🔔 新訂單通知！(單號 #${order.orderId})\n`;
+    message += `桌號: ${order.tableNumber}\n`;
+    message += `人數: ${order.headcount}\n`;
+    message += `-------------------\n`;
+    order.items.forEach(item => {
+        const itemName = item.name?.zh || item.name; // Fallback to name if zh not available
+        message += `‣ ${itemName} x ${item.quantity}\n`;
+        if (item.notes) {
+            message += `  備註: ${item.notes}\n`;
+        }
     });
-});
+    message += `-------------------\n`;
+    message += `總金額: NT$ ${order.totalAmount}`;
+    return message;
+}
+async function sendLineMessage(userId, message) {
+    if(!lineClient) return;
+    try {
+        await lineClient.pushMessage(userId, { type: 'text', text: message });
+        console.log("LINE 訊息已發送至:", userId);
+    } catch (error) {
+        console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error);
+    }
+}
+function getGoogleAuth() {
+    if (!process.env.GOOGLE_CREDENTIALS_JSON) return null;
+    try {
+        const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+        return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' });
+    } catch(e) {
+        console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e);
+        return null;
+    }
+}
+async function appendOrderToGoogleSheet(orderData) {
+  const auth = getGoogleAuth();
+  if (!process.env.GOOGLE_SHEET_ID || !auth) {
+    console.log("未設定 Google Sheet ID 或憑證，跳過寫入。");
+    return;
+  }
+  const t = translations['zh']; 
+  const itemDetailsString = orderData.items.map(item => {
+    const name = item.name?.zh || item.name;
+    const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
+        ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') 
+        : '無';
+    const notes = item.notes ? `備註: ${item.notes}` : '';
+    return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
+  }).join('\n\n');
+  const sheets = google.sheets({ version: 'v4', auth });
+  const values = [[
+      orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+      orderData.table, orderData.headcount, orderData.total, itemDetailsString
+  ]];
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: '訂單紀錄!A:F',
+    valueInputOption: 'USER_ENTERED',
+    resource: { values },
+  });
+  console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
+}
+
+// --- 公用 API ---
 
 app.get('/api/menu', async (req, res) => {
     try {
-        console.log("正在嘗試從資料庫獲取菜單...");
         const result = await pool.query('SELECT * FROM menu_items ORDER BY category, id');
-        console.log(`成功獲取 ${result.rows.length} 筆菜單項目。`);
-        
+        const menu = {};
         const formattedItems = result.rows.map(item => ({
             ...item,
             options: item.options ? item.options.split(',').filter(opt => opt) : []
         }));
-
-        // 【修改後的邏輯】動態建立菜單分類，以恢復「主廚推薦」並提高擴充性
-        const menu = {};
         formattedItems.forEach(item => {
-            if (!menu[item.category]) {
-                menu[item.category] = [];
-            }
+            if (!menu[item.category]) menu[item.category] = [];
             menu[item.category].push(item);
         });
-        
         res.json(menu);
     } catch (err) {
         console.error('查詢菜單時發生錯誤', err);
@@ -92,6 +132,22 @@ app.get('/api/menu', async (req, res) => {
     }
 });
 
+app.get('/api/settings', async (req, res) => {
+    try {
+        const settingsResult = await pool.query('SELECT * FROM app_settings');
+        const settings = settingsResult.rows.reduce((acc, row) => {
+            acc[row.setting_key] = row.setting_value;
+            return acc;
+        }, {});
+        res.json({
+            isAiEnabled: settings.isAiEnabled && !!genAI,
+            saveToGoogleSheet: settings.saveToGoogleSheet
+        });
+    } catch (err) {
+        console.error('讀取設定時發生錯誤', err);
+        res.status(500).json({ message: '讀取設定時發生錯誤' });
+    }
+});
 
 app.post('/api/orders', async (req, res) => {
     const { tableNumber, headcount, totalAmount, items } = req.body;
@@ -102,6 +158,10 @@ app.post('/api/orders', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        
+        const settingsResult = await client.query("SELECT setting_value FROM app_settings WHERE setting_key = 'saveToGoogleSheet'");
+        const shouldSaveToSheet = settingsResult.rows[0]?.setting_value === true;
+
         const orderInsertQuery = 'INSERT INTO orders (table_number, headcount, total_amount, status) VALUES ($1, $2, $3, $4) RETURNING id, created_at';
         const orderResult = await client.query(orderInsertQuery, [tableNumber, headcount, totalAmount, 'received']);
         const newOrderId = orderResult.rows[0].id;
@@ -111,6 +171,7 @@ app.post('/api/orders', async (req, res) => {
             const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
             await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
         }
+        
         await client.query('COMMIT');
         
         console.log(`訂單 #${newOrderId} 已成功儲存至資料庫。`);
@@ -120,16 +181,11 @@ app.post('/api/orders', async (req, res) => {
             sendLineMessage(process.env.LINE_USER_ID, notificationMessage);
         }
         
-        const shouldSaveToSheet = true; 
         if (shouldSaveToSheet) {
-          try {
             await appendOrderToGoogleSheet({
               orderId: newOrderId, timestamp: orderTimestamp, table: tableNumber, headcount,
               total: totalAmount, items: items 
             });
-          } catch (sheetError) {
-            console.error(`訂單 #${newOrderId} 寫入 Google Sheet 失敗:`, sheetError.message);
-          }
         }
         
         res.status(201).json({ message: '訂單已成功接收！', orderId: newOrderId });
@@ -143,14 +199,12 @@ app.post('/api/orders', async (req, res) => {
 });
 
 app.post('/api/recommendation', async (req, res) => {
-    if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
-    
+    // This API remains unchanged
     const { language, cartItems, availableItems } = req.body;
+    if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
     if (!cartItems || !availableItems) return res.status(400).json({ error: "缺少推薦所需的欄位" });
-    
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); // 使用更新的 Flash 模型
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     const prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
-    
     try {
         const result = await model.generateContent(prompt);
         res.json({ recommendation: result.response.text() });
@@ -161,80 +215,90 @@ app.post('/api/recommendation', async (req, res) => {
 });
 
 
-// --- 輔助函式 ---
-function formatOrderForNotification(order) {
-    let message = `🔔 新訂單通知！(單號 #${order.orderId})\n`;
-    message += `桌號: ${order.tableNumber}\n`;
-    message += `人數: ${order.headcount}\n`;
-    message += `-------------------\n`;
-    order.items.forEach(item => {
-        const itemName = item.name?.zh || '未知品項';
-        message += `‣ ${itemName} x ${item.quantity}\n`;
-        if (item.notes) {
-            message += `  備註: ${item.notes}\n`;
+// --- 後台管理 API ---
+
+app.post('/api/admin/login', (req, res) => {
+    const { password } = req.body;
+    if (password && password === process.env.ADMIN_PASSWORD) {
+        res.status(200).json({ message: '登入成功' });
+    } else {
+        res.status(401).json({ message: '密碼錯誤' });
+    }
+});
+
+app.get('/api/admin/settings', async (req, res) => {
+    try {
+        const settingsResult = await pool.query('SELECT * FROM app_settings');
+        const settings = settingsResult.rows.reduce((acc, row) => {
+            acc[row.setting_key] = row.setting_value;
+            return acc;
+        }, {});
+        res.json(settings);
+    } catch (err) {
+        res.status(500).json({ message: '讀取設定錯誤' });
+    }
+});
+
+app.put('/api/admin/settings', async (req, res) => {
+    const settingsToUpdate = req.body;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const [key, value] of Object.entries(settingsToUpdate)) {
+            await client.query(
+                'UPDATE app_settings SET setting_value = $1 WHERE setting_key = $2',
+                [value, key]
+            );
         }
-    });
-    message += `-------------------\n`;
-    message += `總金額: NT$ ${order.totalAmount}`;
-    return message;
-}
-
-async function sendLineMessage(userId, message) {
-    if(!lineClient) {
-        console.log("LINE Client 未初始化，跳過發送訊息。");
-        return;
+        await client.query('COMMIT');
+        res.status(200).json({ message: '設定已更新' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('更新設定時發生錯誤', err);
+        res.status(500).json({ message: '更新設定時發生錯誤' });
+    } finally {
+        client.release();
     }
+});
+
+app.post('/api/menu_items', async (req, res) => {
+    const { name, price, image, description, category, options } = req.body;
+    const query = 'INSERT INTO menu_items (name, price, image, description, category, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
+    const values = [name, price, image, description, category, options];
     try {
-        await lineClient.pushMessage(userId, { type: 'text', text: message });
-        console.log("LINE 訊息已發送至:", userId);
-    } catch (error) {
-        console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error);
+        const result = await pool.query(query, values);
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('新增品項時發生錯誤:', err);
+        res.status(500).json({ message: '新增品項失敗' });
     }
-}
+});
 
-function getGoogleAuth() {
-    if (!process.env.GOOGLE_CREDENTIALS_JSON) { return null; }
+app.put('/api/menu_items/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, price, image, description, category, options } = req.body;
+    const query = 'UPDATE menu_items SET name=$1, price=$2, image=$3, description=$4, category=$5, options=$6 WHERE id=$7 RETURNING *';
+    const values = [name, price, image, description, category, options, id];
     try {
-        const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-        return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' });
-    } catch(e) {
-        console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e);
-        return null;
+        const result = await pool.query(query, values);
+        res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error('更新品項時發生錯誤:', err);
+        res.status(500).json({ message: '更新品項失敗' });
     }
-}
+});
 
-async function appendOrderToGoogleSheet(orderData) {
-  const auth = getGoogleAuth();
-  if (!process.env.GOOGLE_SHEET_ID || !auth) {
-    console.log("未正確設定 Google Sheet ID 或憑證，跳過寫入。");
-    return;
-  }
-  
-  const t = translations['zh']; 
-  const itemDetailsString = orderData.items.map(item => {
-    const name = item.name?.zh || '未知品項';
-    const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
-        ? Object.entries(item.selectedOptions).map(([key, value]) => {
-            return t.options[key]?.[value] || value;
-        }).join(', ') 
-        : '無';
-    const notes = item.notes ? `備註: ${item.notes}` : '';
-    return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
-  }).join('\n\n');
+app.delete('/api/menu_items/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await pool.query('DELETE FROM menu_items WHERE id=$1', [id]);
+        res.status(204).send(); // No Content
+    } catch (err) {
+        console.error('刪除品項時發生錯誤:', err);
+        res.status(500).json({ message: '刪除品項失敗' });
+    }
+});
 
-  const sheets = google.sheets({ version: 'v4', auth });
-  const values = [[
-      orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
-      orderData.table, orderData.headcount, orderData.total, itemDetailsString
-  ]];
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: '訂單紀錄!A:F',
-    valueInputOption: 'USER_ENTERED',
-    resource: { values },
-  });
-  console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
-}
-
-app.listen(PORT, () => console.log(`後端伺服器 (v18 - 最終修復版) 正在 http://localhost:${PORT} 上運行`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`後端伺服器 (含後台API) 正在 http://localhost:${PORT} 上運行`));
