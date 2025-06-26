@@ -72,6 +72,9 @@ app.get('/api/menu', async (req, res) => {
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         
+        // ** 修正：將寫死的範例資料格式統一，並使用真實圖片 **
+        // 直接從資料庫讀取 'limited' 分類的項目
+        
         const formattedItems = result.rows.map(item => ({
             ...item,
             options: item.options ? item.options.split(',').filter(opt => opt) : []
@@ -159,9 +162,79 @@ app.post('/api/recommendation', async (req, res) => {
 
 
 // --- 輔助函式 ---
-function formatOrderForNotification(order) { /* ... 保持不變 ... */ }
-async function sendLineMessage(userId, message) { /* ... 保持不變 ... */ }
-function getGoogleAuth() { /* ... 保持不變 ... */ }
-async function appendOrderToGoogleSheet(orderData) { /* ... 保持不變 ... */ }
+function formatOrderForNotification(order) {
+    let message = `🔔 新訂單通知！(單號 #${order.orderId})\n`;
+    message += `桌號: ${order.tableNumber}\n`;
+    message += `人數: ${order.headcount}\n`;
+    message += `-------------------\n`;
+    order.items.forEach(item => {
+        const itemName = item.name?.zh || '未知品項';
+        message += `‣ ${itemName} x ${item.quantity}\n`;
+        if (item.notes) {
+            message += `  備註: ${item.notes}\n`;
+        }
+    });
+    message += `-------------------\n`;
+    message += `總金額: NT$ ${order.totalAmount}`;
+    return message;
+}
+
+async function sendLineMessage(userId, message) {
+    if(!lineClient) {
+        console.log("LINE Client 未初始化，跳過發送訊息。");
+        return;
+    }
+    try {
+        await lineClient.pushMessage(userId, { type: 'text', text: message });
+        console.log("LINE 訊息已發送至:", userId);
+    } catch (error) {
+        console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error);
+    }
+}
+
+function getGoogleAuth() {
+    if (!process.env.GOOGLE_CREDENTIALS_JSON) { return null; }
+    try {
+        const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+        return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' });
+    } catch(e) {
+        console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e);
+        return null;
+    }
+}
+
+async function appendOrderToGoogleSheet(orderData) {
+  const auth = getGoogleAuth();
+  if (!process.env.GOOGLE_SHEET_ID || !auth) {
+    console.log("未正確設定 Google Sheet ID 或憑證，跳過寫入。");
+    return;
+  }
+  
+  const t = translations['zh']; 
+  const itemDetailsString = orderData.items.map(item => {
+    const name = item.name?.zh || '未知品項';
+    const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
+        ? Object.entries(item.selectedOptions).map(([key, value]) => {
+            return t.options[key]?.[value] || value;
+        }).join(', ') 
+        : '無';
+    const notes = item.notes ? `備註: ${item.notes}` : '';
+    return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
+  }).join('\n\n');
+
+  const sheets = google.sheets({ version: 'v4', auth });
+  const values = [[
+      orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+      orderData.table, orderData.headcount, orderData.total, itemDetailsString
+  ]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: '訂單紀錄!A:F',
+    valueInputOption: 'USER_ENTERED',
+    resource: { values },
+  });
+  console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
+}
 
 app.listen(PORT, () => console.log(`後端伺服器 (v16 - 最終修復版) 正在 http://localhost:${PORT} 上運行`));
