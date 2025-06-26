@@ -72,9 +72,6 @@ app.get('/api/menu', async (req, res) => {
         
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         
-        // ** 修正：將寫死的範例資料格式統一，並使用真實圖片 **
-        // 直接從資料庫讀取 'limited' 分類的項目
-        
         const formattedItems = result.rows.map(item => ({
             ...item,
             options: item.options ? item.options.split(',').filter(opt => opt) : []
@@ -148,7 +145,7 @@ app.post('/api/recommendation', async (req, res) => {
     const { language, cartItems, availableItems } = req.body;
     if (!cartItems || !availableItems) return res.status(400).json({ error: "缺少推薦所需的欄位" });
     
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
     const prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
     
     try {
@@ -237,4 +234,4 @@ async function appendOrderToGoogleSheet(orderData) {
   console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
 }
 
-app.listen(PORT, () => console.log(`後端伺服器 (v16 - 最終修復版) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v17 - 最終修復版) 正在 http://localhost:${PORT} 上運行`));
