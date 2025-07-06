@@ -1,3 +1,4 @@
+// --- server.js (v19 - 後台系統與每日工作表) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -9,7 +10,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 // --- 資料庫連線設定 ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
 // --- 服務初始化 ---
@@ -53,7 +54,7 @@ function formatOrderForNotification(order) {
     message += `人數: ${order.headcount}\n`;
     message += `-------------------\n`;
     order.items.forEach(item => {
-        const itemName = item.name?.zh || item.name; // Fallback to name if zh not available
+        const itemName = item.name?.zh || item.name;
         message += `‣ ${itemName} x ${item.quantity}\n`;
         if (item.notes) {
             message += `  備註: ${item.notes}\n`;
@@ -83,47 +84,95 @@ function getGoogleAuth() {
     }
 }
 async function appendOrderToGoogleSheet(orderData) {
-  const auth = getGoogleAuth();
-  if (!process.env.GOOGLE_SHEET_ID || !auth) {
-    console.log("未設定 Google Sheet ID 或憑證，跳過寫入。");
-    return;
-  }
-  const t = translations['zh']; 
-  const itemDetailsString = orderData.items.map(item => {
-    const name = item.name?.zh || item.name;
-    const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
-        ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') 
-        : '無';
-    const notes = item.notes ? `備註: ${item.notes}` : '';
-    return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
-  }).join('\n\n');
-  const sheets = google.sheets({ version: 'v4', auth });
-  const values = [[
-      orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
-      orderData.table, orderData.headcount, orderData.total, itemDetailsString
-  ]];
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: '訂單紀錄!A:F',
-    valueInputOption: 'USER_ENTERED',
-    resource: { values },
-  });
-  console.log(`訂單 #${orderData.orderId} 已成功寫入 Google Sheet。`);
+    const auth = getGoogleAuth();
+    if (!process.env.GOOGLE_SHEET_ID || !auth) {
+        console.log("未設定 Google Sheet ID 或憑證，跳過寫入。");
+        return;
+    }
+    const sheets = google.sheets({ version: 'v4', auth });
+    
+    // --- 【修改】建立每日工作表 ---
+    const today = new Date();
+    const timezoneOffset = -480; // Taiwan is UTC+8, but JS getTimezoneOffset is inverted and in minutes
+    const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000);
+    const sheetName = localToday.toISOString().split('T')[0]; // Format: YYYY-MM-DD
+
+    try {
+        // 檢查工作表是否存在
+        const spreadsheetInfo = await sheets.spreadsheets.get({
+            spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        });
+        const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName);
+
+        // 如果工作表不存在，就建立一個新的
+        if (!sheetExists) {
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                resource: {
+                    requests: [{
+                        addSheet: {
+                            properties: { title: sheetName }
+                        }
+                    }]
+                }
+            });
+            // 在新工作表加入標頭
+            await sheets.spreadsheets.values.append({
+                spreadsheetId: process.env.GOOGLE_SHEET_ID,
+                range: `${sheetName}!A1`,
+                valueInputOption: 'USER_ENTERED',
+                resource: {
+                    values: [['訂單ID', '下單時間', '桌號', '人數', '總金額', '餐點詳情']],
+                },
+            });
+             console.log(`已建立新的每日工作表: ${sheetName}`);
+        }
+    } catch (err) {
+        console.error("檢查或建立工作表時發生錯誤:", err);
+        // 如果發生錯誤，就退回寫入預設工作表
+        const fallbackSheetName = '訂單紀錄';
+        console.log(`將嘗試寫入預設工作表: ${fallbackSheetName}`);
+    }
+    // --- 修改結束 ---
+    
+    const t = translations['zh']; 
+    const itemDetailsString = orderData.items.map(item => {
+        const name = item.name?.zh || '未知品項';
+        const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
+            ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') 
+            : '無';
+        const notes = item.notes ? `備註: ${item.notes}` : '';
+        return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
+    }).join('\n\n');
+
+    const values = [[
+        orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+        orderData.table, orderData.headcount, orderData.total, itemDetailsString
+    ]];
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        range: `${sheetName}!A:F`, // 使用動態工作表名稱
+        valueInputOption: 'USER_ENTERED',
+        resource: { values },
+    });
+    console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`);
 }
 
 // --- 公用 API ---
 
 app.get('/api/menu', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM menu_items ORDER BY category, id');
-        const menu = {};
+        const result = await pool.query('SELECT * FROM menu_items ORDER BY id');
+        const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
         const formattedItems = result.rows.map(item => ({
             ...item,
             options: item.options ? item.options.split(',').filter(opt => opt) : []
         }));
         formattedItems.forEach(item => {
-            if (!menu[item.category]) menu[item.category] = [];
-            menu[item.category].push(item);
+            if (menu[item.category]) {
+                menu[item.category].push(item);
+            }
         });
         res.json(menu);
     } catch (err) {
@@ -199,7 +248,6 @@ app.post('/api/orders', async (req, res) => {
 });
 
 app.post('/api/recommendation', async (req, res) => {
-    // This API remains unchanged
     const { language, cartItems, availableItems } = req.body;
     if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
     if (!cartItems || !availableItems) return res.status(400).json({ error: "缺少推薦所需的欄位" });
@@ -291,8 +339,9 @@ app.put('/api/menu_items/:id', async (req, res) => {
 app.delete('/api/menu_items/:id', async (req, res) => {
     const { id } = req.params;
     try {
+        await pool.query('DELETE FROM order_items WHERE menu_item_id=$1', [id]);
         await pool.query('DELETE FROM menu_items WHERE id=$1', [id]);
-        res.status(204).send(); // No Content
+        res.status(204).send();
     } catch (err) {
         console.error('刪除品項時發生錯誤:', err);
         res.status(500).json({ message: '刪除品項失敗' });
@@ -301,4 +350,4 @@ app.delete('/api/menu_items/:id', async (req, res) => {
 
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`後端伺服器 (含後台API) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v19 - 後台系統與每日工作表) 正在 http://localhost:${PORT} 上運行`));
