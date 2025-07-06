@@ -1,4 +1,4 @@
-// --- server.js (v20 - AI翻譯與儲存優化) ---
+// --- server.js (v21 - 新增餐點修正) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -37,11 +37,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- 輔助函式 (略) ---
+// --- 輔助函式 (此處省略以保持簡潔，內容與前版相同) ---
 const translations = { zh: { options: { spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" }, sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" }, ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" }, size: { name: "份量", small: "小份", large: "大份" }, }, }, };
 function formatOrderForNotification(order) { let message = `🔔 新訂單通知！(單號 #${order.orderId})\n桌號: ${order.tableNumber}\n人數: ${order.headcount}\n-------------------\n`; order.items.forEach(item => { const itemName = item.name?.zh || item.name; message += `‣ ${itemName} x ${item.quantity}\n`; if (item.notes) { message += `  備註: ${item.notes}\n`; } }); message += `-------------------\n總金額: NT$ ${order.totalAmount}`; return message; }
 async function sendLineMessage(userId, message) { if(!lineClient) return; try { await lineClient.pushMessage(userId, { type: 'text', text: message }); console.log("LINE 訊息已發送至:", userId); } catch (error) { console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error); } }
-function getGoogleAuth() { if (!process.env.GOOGLE_CREDENTIALS_JSON) return null; try { const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON); return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' }); } catch(e) { console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e); return null; } }
+function getGoogleAuth() { if (!process.env.GOOGLE_CREDENTIALS_JSON) return null; try { const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON); return new google.auth.GoogleAuth({ credentials, scopes: '[https://www.googleapis.com/auth/spreadsheets](https://www.googleapis.com/auth/spreadsheets)' }); } catch(e) { console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e); return null; } }
 async function appendOrderToGoogleSheet(orderData) { const auth = getGoogleAuth(); if (!process.env.GOOGLE_SHEET_ID || !auth) { console.log("未設定 Google Sheet ID 或憑證，跳過寫入。"); return; } const sheets = google.sheets({ version: 'v4', auth }); const today = new Date(); const timezoneOffset = -480; const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000); const sheetName = localToday.toISOString().split('T')[0]; try { const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID }); const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName); if (!sheetExists) { await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SHEET_ID, resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] } }); await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', resource: { values: [['訂單ID', '下單時間', '桌號', '人數', '總金額', '餐點詳情']] } }); console.log(`已建立新的每日工作表: ${sheetName}`); } } catch (err) { console.error("檢查或建立工作表時發生錯誤:", err); } const t = translations['zh']; const itemDetailsString = orderData.items.map(item => { const name = item.name?.zh || '未知品項'; const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0 ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') : '無'; const notes = item.notes ? `備註: ${item.notes}` : ''; return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim(); }).join('\n\n'); const values = [[ orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), orderData.table, orderData.headcount, orderData.total, itemDetailsString ]]; await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A:F`, valueInputOption: 'USER_ENTERED', resource: { values } }); console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`); }
 
 // --- 公用 API ---
@@ -122,7 +122,7 @@ app.post('/api/orders', async (req, res) => {
             await client.query('COMMIT');
             console.log(`訂單 #${newOrderId} 已成功儲存至資料庫。`);
         } else {
-            newOrderId = `GS-${Date.now()}`; // 如果不存資料庫，給一個臨時ID
+            newOrderId = `GS-${Date.now()}`;
         }
         
         const notificationMessage = formatOrderForNotification({ ...req.body, orderId: newOrderId });
@@ -152,7 +152,7 @@ app.post('/api/recommendation', async (req, res) => {
     if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
     
     let prompt;
-    if (!cartItems) {
+    if (!cartItems || cartItems.length === 0) {
         prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user's cart is empty. Please recommend 2-3 popular starting items or appetizers from the menu to get them started. Be enticing and friendly. Here is the list of available menu items to choose from: ${availableItems}.`;
     } else {
         prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
@@ -215,7 +215,7 @@ app.put('/api/admin/settings', async (req, res) => {
     }
 });
 
-// 【全新】AI 翻譯並新增餐點的 API
+// 【已修正】AI 翻譯並新增餐點的 API
 app.post('/api/admin/translate-and-add-item', async (req, res) => {
     if (!genAI) {
         return res.status(503).json({ message: "AI 翻譯功能未啟用。" });
@@ -226,6 +226,7 @@ app.post('/api/admin/translate-and-add-item', async (req, res) => {
         return res.status(400).json({ message: "缺少必要欄位：中文名稱、價格、分類。" });
     }
 
+    let aiResponseText = "N/A";
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const prompt = `Translate the following JSON object values from Traditional Chinese to English. Respond with ONLY a valid JSON object.
@@ -237,11 +238,19 @@ Input:
 Output:`;
 
         const result = await model.generateContent(prompt);
-        const text = result.response.text();
-        const translated = JSON.parse(text);
+        aiResponseText = result.response.text();
+        
+        // --- 【修正】穩健的 JSON 清理與解析 ---
+        const jsonMatch = aiResponseText.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+            throw new Error("AI did not return a valid JSON object.");
+        }
+        const jsonString = jsonMatch[0];
+        const translated = JSON.parse(jsonString);
+        // --- 修正結束 ---
 
-        const name = { zh: name_zh, en: translated.name };
-        const description = { zh: description_zh, en: translated.description };
+        const name = { zh: name_zh, en: translated.name || name_zh }; // 如果翻譯失敗，使用中文作為備用
+        const description = { zh: description_zh, en: translated.description || description_zh };
 
         const query = 'INSERT INTO menu_items (name, price, image, description, category, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
         const values = [name, price, image, description, category, options];
@@ -250,15 +259,19 @@ Output:`;
         res.status(201).json(dbResult.rows[0]);
 
     } catch (error) {
-        console.error("新增餐點並翻譯時發生錯誤:", error);
-        res.status(500).json({ message: "新增餐點失敗，請檢查後端日誌。" });
+        console.error("新增餐點並翻譯時發生錯誤:", {
+            errorMessage: error.message,
+            originalRequestBody: req.body,
+            aiRawResponse: aiResponseText,
+            errorStack: error.stack
+        });
+        res.status(500).json({ message: "新增餐點失敗，請檢查後端日誌以獲取詳細資訊。" });
     }
 });
 
 
 app.put('/api/menu_items/:id', async (req, res) => {
     const { id } = req.params;
-    // 注意：此處的編輯功能尚未整合AI翻譯，僅儲存傳入的資料
     const { name, price, image, description, category, options } = req.body;
     const query = 'UPDATE menu_items SET name=$1, price=$2, image=$3, description=$4, category=$5, options=$6 WHERE id=$7 RETURNING *';
     const values = [name, price, image, description, category, options, id];
@@ -274,9 +287,7 @@ app.put('/api/menu_items/:id', async (req, res) => {
 app.delete('/api/menu_items/:id', async (req, res) => {
     const { id } = req.params;
     try {
-        // 先刪除與訂單關聯的項目，避免外鍵約束問題
         await pool.query('DELETE FROM order_items WHERE menu_item_id=$1', [id]);
-        // 再刪除菜單項目本身
         await pool.query('DELETE FROM menu_items WHERE id=$1', [id]);
         res.status(204).send();
     } catch (err) {
@@ -285,5 +296,5 @@ app.delete('/api/menu_items/:id', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`後端伺服器 (v20) 正在 http://localhost:${PORT} 上運行`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`後端伺服器 (v21) 正在 http://localhost:${PORT} 上運行`));
