@@ -1,4 +1,4 @@
-// --- server.js (v19 - 後台系統與每日工作表) ---
+// --- server.js (v20 - AI翻譯與儲存優化) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -10,7 +10,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 // --- 資料庫連線設定 ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  ssl: { rejectUnauthorized: false },
 });
 
 // --- 服務初始化 ---
@@ -37,127 +37,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- 輔助函式 ---
-const translations = {
-  zh: {
-    options: {
-        spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" },
-        sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" },
-        ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" },
-        size: { name: "份量", small: "小份", large: "大份" },
-    },
-  },
-};
-function formatOrderForNotification(order) {
-    let message = `🔔 新訂單通知！(單號 #${order.orderId})\n`;
-    message += `桌號: ${order.tableNumber}\n`;
-    message += `人數: ${order.headcount}\n`;
-    message += `-------------------\n`;
-    order.items.forEach(item => {
-        const itemName = item.name?.zh || item.name;
-        message += `‣ ${itemName} x ${item.quantity}\n`;
-        if (item.notes) {
-            message += `  備註: ${item.notes}\n`;
-        }
-    });
-    message += `-------------------\n`;
-    message += `總金額: NT$ ${order.totalAmount}`;
-    return message;
-}
-async function sendLineMessage(userId, message) {
-    if(!lineClient) return;
-    try {
-        await lineClient.pushMessage(userId, { type: 'text', text: message });
-        console.log("LINE 訊息已發送至:", userId);
-    } catch (error) {
-        console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error);
-    }
-}
-function getGoogleAuth() {
-    if (!process.env.GOOGLE_CREDENTIALS_JSON) return null;
-    try {
-        const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-        return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' });
-    } catch(e) {
-        console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e);
-        return null;
-    }
-}
-async function appendOrderToGoogleSheet(orderData) {
-    const auth = getGoogleAuth();
-    if (!process.env.GOOGLE_SHEET_ID || !auth) {
-        console.log("未設定 Google Sheet ID 或憑證，跳過寫入。");
-        return;
-    }
-    const sheets = google.sheets({ version: 'v4', auth });
-    
-    // --- 【修改】建立每日工作表 ---
-    const today = new Date();
-    const timezoneOffset = -480; // Taiwan is UTC+8, but JS getTimezoneOffset is inverted and in minutes
-    const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000);
-    const sheetName = localToday.toISOString().split('T')[0]; // Format: YYYY-MM-DD
-
-    try {
-        // 檢查工作表是否存在
-        const spreadsheetInfo = await sheets.spreadsheets.get({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        });
-        const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName);
-
-        // 如果工作表不存在，就建立一個新的
-        if (!sheetExists) {
-            await sheets.spreadsheets.batchUpdate({
-                spreadsheetId: process.env.GOOGLE_SHEET_ID,
-                resource: {
-                    requests: [{
-                        addSheet: {
-                            properties: { title: sheetName }
-                        }
-                    }]
-                }
-            });
-            // 在新工作表加入標頭
-            await sheets.spreadsheets.values.append({
-                spreadsheetId: process.env.GOOGLE_SHEET_ID,
-                range: `${sheetName}!A1`,
-                valueInputOption: 'USER_ENTERED',
-                resource: {
-                    values: [['訂單ID', '下單時間', '桌號', '人數', '總金額', '餐點詳情']],
-                },
-            });
-             console.log(`已建立新的每日工作表: ${sheetName}`);
-        }
-    } catch (err) {
-        console.error("檢查或建立工作表時發生錯誤:", err);
-        // 如果發生錯誤，就退回寫入預設工作表
-        const fallbackSheetName = '訂單紀錄';
-        console.log(`將嘗試寫入預設工作表: ${fallbackSheetName}`);
-    }
-    // --- 修改結束 ---
-    
-    const t = translations['zh']; 
-    const itemDetailsString = orderData.items.map(item => {
-        const name = item.name?.zh || '未知品項';
-        const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0
-            ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') 
-            : '無';
-        const notes = item.notes ? `備註: ${item.notes}` : '';
-        return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim();
-    }).join('\n\n');
-
-    const values = [[
-        orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
-        orderData.table, orderData.headcount, orderData.total, itemDetailsString
-    ]];
-
-    await sheets.spreadsheets.values.append({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: `${sheetName}!A:F`, // 使用動態工作表名稱
-        valueInputOption: 'USER_ENTERED',
-        resource: { values },
-    });
-    console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`);
-}
+// --- 輔助函式 (略) ---
+const translations = { zh: { options: { spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" }, sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" }, ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" }, size: { name: "份量", small: "小份", large: "大份" }, }, }, };
+function formatOrderForNotification(order) { let message = `🔔 新訂單通知！(單號 #${order.orderId})\n桌號: ${order.tableNumber}\n人數: ${order.headcount}\n-------------------\n`; order.items.forEach(item => { const itemName = item.name?.zh || item.name; message += `‣ ${itemName} x ${item.quantity}\n`; if (item.notes) { message += `  備註: ${item.notes}\n`; } }); message += `-------------------\n總金額: NT$ ${order.totalAmount}`; return message; }
+async function sendLineMessage(userId, message) { if(!lineClient) return; try { await lineClient.pushMessage(userId, { type: 'text', text: message }); console.log("LINE 訊息已發送至:", userId); } catch (error) { console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error); } }
+function getGoogleAuth() { if (!process.env.GOOGLE_CREDENTIALS_JSON) return null; try { const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON); return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' }); } catch(e) { console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e); return null; } }
+async function appendOrderToGoogleSheet(orderData) { const auth = getGoogleAuth(); if (!process.env.GOOGLE_SHEET_ID || !auth) { console.log("未設定 Google Sheet ID 或憑證，跳過寫入。"); return; } const sheets = google.sheets({ version: 'v4', auth }); const today = new Date(); const timezoneOffset = -480; const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000); const sheetName = localToday.toISOString().split('T')[0]; try { const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID }); const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName); if (!sheetExists) { await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SHEET_ID, resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] } }); await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', resource: { values: [['訂單ID', '下單時間', '桌號', '人數', '總金額', '餐點詳情']] } }); console.log(`已建立新的每日工作表: ${sheetName}`); } } catch (err) { console.error("檢查或建立工作表時發生錯誤:", err); } const t = translations['zh']; const itemDetailsString = orderData.items.map(item => { const name = item.name?.zh || '未知品項'; const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0 ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') : '無'; const notes = item.notes ? `備註: ${item.notes}` : ''; return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim(); }).join('\n\n'); const values = [[ orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), orderData.table, orderData.headcount, orderData.total, itemDetailsString ]]; await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A:F`, valueInputOption: 'USER_ENTERED', resource: { values } }); console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`); }
 
 // --- 公用 API ---
 
@@ -190,7 +75,8 @@ app.get('/api/settings', async (req, res) => {
         }, {});
         res.json({
             isAiEnabled: settings.isAiEnabled && !!genAI,
-            saveToGoogleSheet: settings.saveToGoogleSheet
+            saveToGoogleSheet: settings.saveToGoogleSheet,
+            saveToDatabase: settings.saveToDatabase,
         });
     } catch (err) {
         console.error('讀取設定時發生錯誤', err);
@@ -206,24 +92,38 @@ app.post('/api/orders', async (req, res) => {
 
     const client = await pool.connect();
     try {
-        await client.query('BEGIN');
-        
-        const settingsResult = await client.query("SELECT setting_value FROM app_settings WHERE setting_key = 'saveToGoogleSheet'");
-        const shouldSaveToSheet = settingsResult.rows[0]?.setting_value === true;
+        const settingsResult = await client.query("SELECT * FROM app_settings");
+        const settings = settingsResult.rows.reduce((acc, row) => {
+            acc[row.setting_key] = row.setting_value;
+            return acc;
+        }, {});
 
-        const orderInsertQuery = 'INSERT INTO orders (table_number, headcount, total_amount, status) VALUES ($1, $2, $3, $4) RETURNING id, created_at';
-        const orderResult = await client.query(orderInsertQuery, [tableNumber, headcount, totalAmount, 'received']);
-        const newOrderId = orderResult.rows[0].id;
-        const orderTimestamp = orderResult.rows[0].created_at;
+        const shouldSaveToSheet = settings.saveToGoogleSheet === true;
+        const shouldSaveToDatabase = settings.saveToDatabase === true;
 
-        for (const item of items) {
-            const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
-            await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
+        if (!shouldSaveToDatabase && !shouldSaveToSheet) {
+            return res.status(400).json({ message: '沒有設定任何訂單儲存方式，無法處理訂單。' });
         }
-        
-        await client.query('COMMIT');
-        
-        console.log(`訂單 #${newOrderId} 已成功儲存至資料庫。`);
+
+        let newOrderId = 'N/A';
+        let orderTimestamp = new Date();
+
+        if (shouldSaveToDatabase) {
+            await client.query('BEGIN');
+            const orderInsertQuery = 'INSERT INTO orders (table_number, headcount, total_amount, status) VALUES ($1, $2, $3, $4) RETURNING id, created_at';
+            const orderResult = await client.query(orderInsertQuery, [tableNumber, headcount, totalAmount, 'received']);
+            newOrderId = orderResult.rows[0].id;
+            orderTimestamp = orderResult.rows[0].created_at;
+
+            for (const item of items) {
+                const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
+                await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
+            }
+            await client.query('COMMIT');
+            console.log(`訂單 #${newOrderId} 已成功儲存至資料庫。`);
+        } else {
+            newOrderId = `GS-${Date.now()}`; // 如果不存資料庫，給一個臨時ID
+        }
         
         const notificationMessage = formatOrderForNotification({ ...req.body, orderId: newOrderId });
         if (lineClient && process.env.LINE_USER_ID) {
@@ -239,21 +139,27 @@ app.post('/api/orders', async (req, res) => {
         
         res.status(201).json({ message: '訂單已成功接收！', orderId: newOrderId });
     } catch (err) {
-        await client.query('ROLLBACK');
+        if (client) await client.query('ROLLBACK');
         console.error('建立訂單時發生錯誤', err);
         res.status(500).json({ message: '建立訂單時伺服器發生錯誤。' });
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
 app.post('/api/recommendation', async (req, res) => {
     const { language, cartItems, availableItems } = req.body;
     if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
-    if (!cartItems || !availableItems) return res.status(400).json({ error: "缺少推薦所需的欄位" });
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
+    
+    let prompt;
+    if (!cartItems) {
+        prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user's cart is empty. Please recommend 2-3 popular starting items or appetizers from the menu to get them started. Be enticing and friendly. Here is the list of available menu items to choose from: ${availableItems}.`;
+    } else {
+        prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
+    }
+
     try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const result = await model.generateContent(prompt);
         res.json({ recommendation: result.response.text() });
     } catch (error) {
@@ -309,21 +215,50 @@ app.put('/api/admin/settings', async (req, res) => {
     }
 });
 
-app.post('/api/menu_items', async (req, res) => {
-    const { name, price, image, description, category, options } = req.body;
-    const query = 'INSERT INTO menu_items (name, price, image, description, category, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
-    const values = [name, price, image, description, category, options];
+// 【全新】AI 翻譯並新增餐點的 API
+app.post('/api/admin/translate-and-add-item', async (req, res) => {
+    if (!genAI) {
+        return res.status(503).json({ message: "AI 翻譯功能未啟用。" });
+    }
+
+    const { name_zh, description_zh, price, category, image, options } = req.body;
+    if (!name_zh || !price || !category) {
+        return res.status(400).json({ message: "缺少必要欄位：中文名稱、價格、分類。" });
+    }
+
     try {
-        const result = await pool.query(query, values);
-        res.status(201).json(result.rows[0]);
-    } catch (err) {
-        console.error('新增品項時發生錯誤:', err);
-        res.status(500).json({ message: '新增品項失敗' });
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const prompt = `Translate the following JSON object values from Traditional Chinese to English. Respond with ONLY a valid JSON object.
+Input: 
+{
+  "name": "${name_zh}",
+  "description": "${description_zh || ' '}"
+}
+Output:`;
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        const translated = JSON.parse(text);
+
+        const name = { zh: name_zh, en: translated.name };
+        const description = { zh: description_zh, en: translated.description };
+
+        const query = 'INSERT INTO menu_items (name, price, image, description, category, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
+        const values = [name, price, image, description, category, options];
+        
+        const dbResult = await pool.query(query, values);
+        res.status(201).json(dbResult.rows[0]);
+
+    } catch (error) {
+        console.error("新增餐點並翻譯時發生錯誤:", error);
+        res.status(500).json({ message: "新增餐點失敗，請檢查後端日誌。" });
     }
 });
 
+
 app.put('/api/menu_items/:id', async (req, res) => {
     const { id } = req.params;
+    // 注意：此處的編輯功能尚未整合AI翻譯，僅儲存傳入的資料
     const { name, price, image, description, category, options } = req.body;
     const query = 'UPDATE menu_items SET name=$1, price=$2, image=$3, description=$4, category=$5, options=$6 WHERE id=$7 RETURNING *';
     const values = [name, price, image, description, category, options, id];
@@ -339,7 +274,9 @@ app.put('/api/menu_items/:id', async (req, res) => {
 app.delete('/api/menu_items/:id', async (req, res) => {
     const { id } = req.params;
     try {
+        // 先刪除與訂單關聯的項目，避免外鍵約束問題
         await pool.query('DELETE FROM order_items WHERE menu_item_id=$1', [id]);
+        // 再刪除菜單項目本身
         await pool.query('DELETE FROM menu_items WHERE id=$1', [id]);
         res.status(204).send();
     } catch (err) {
@@ -348,6 +285,5 @@ app.delete('/api/menu_items/:id', async (req, res) => {
     }
 });
 
-
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`後端伺服器 (v19 - 後台系統與每日工作表) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v20) 正在 http://localhost:${PORT} 上運行`));
