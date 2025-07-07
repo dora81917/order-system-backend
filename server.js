@@ -1,4 +1,4 @@
-// --- server.js (v24 - 健康檢查修正) ---
+// --- server.js (v25 - 改用 ImgBB 圖片上傳) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -23,23 +23,38 @@ const pool = new Pool({
 });
 
 // --- 服務初始化 ---
-let lineClient = null; if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) { lineClient = new line.Client({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN, channelSecret: process.env.LINE_CHANNEL_SECRET }); console.log("LINE Bot Client 已成功初始化。"); } else { console.warn("警告：未提供 LINE Bot 金鑰，通知功能將被停用。"); }
-let genAI = null; if(process.env.GEMINI_API_KEY) { genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); console.log("Gemini AI Client 已成功初始化。"); } else { console.warn("警告：未提供 GEMINI_API_KEY，AI 推薦功能將被停用。"); }
+let lineClient = null;
+if (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_CHANNEL_SECRET) {
+    lineClient = new line.Client({
+      channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+      channelSecret: process.env.LINE_CHANNEL_SECRET,
+    });
+    console.log("LINE Bot Client 已成功初始化。");
+} else {
+    console.warn("警告：未提供 LINE Bot 金鑰，通知功能將被停用。");
+}
+
+let genAI = null;
+if(process.env.GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    console.log("Gemini AI Client 已成功初始化。");
+} else {
+    console.warn("警告：未提供 GEMINI_API_KEY，AI 推薦功能將被停用。");
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- 輔助函式 (略)... ---
+// --- 輔助函式 ---
 const translations = { zh: { options: { spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" }, sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" }, ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" }, size: { name: "份量", small: "小份", large: "大份" }, }, }, };
 function formatOrderForNotification(order) { let message = `🔔 新訂單通知！(單號 #${order.orderId})\n桌號: ${order.tableNumber}\n人數: ${order.headcount}\n-------------------\n`; order.items.forEach(item => { const itemName = item.name?.zh || item.name; message += `‣ ${itemName} x ${item.quantity}\n`; if (item.notes) { message += `  備註: ${item.notes}\n`; } }); message += `-------------------\n總金額 (含手續費): NT$ ${order.finalAmount}`; return message; }
 async function sendLineMessage(userId, message) { if(!lineClient) return; try { await lineClient.pushMessage(userId, { type: 'text', text: message }); console.log("LINE 訊息已發送至:", userId); } catch (error) { console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error); } }
 function getGoogleAuth() { if (!process.env.GOOGLE_CREDENTIALS_JSON) return null; try { const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON); return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' }); } catch(e) { console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e); return null; } }
-async function appendOrderToGoogleSheet(orderData) { const auth = getGoogleAuth(); if (!process.env.GOOGLE_SHEET_ID || !auth) { console.log("未設定 Google Sheet ID 或憑證，跳過寫入。"); return; } const sheets = google.sheets({ version: 'v4', auth }); const today = new Date(); const timezoneOffset = -480; const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000); const sheetName = localToday.toISOString().split('T')[0]; try { const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID }); const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName); if (!sheetExists) { await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SHEET_ID, resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] } }); await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', resource: { values: [['訂單ID', '下單時間', '桌號', '人數', '餐點總計', '手續費', '最終金額', '餐點詳情']] } }); console.log(`已建立新的每日工作表: ${sheetName}`); } } catch (err) { console.error("檢查或建立工作表時發生錯誤:", err); } const t = translations['zh']; const itemDetailsString = orderData.items.map(item => { const name = item.name?.zh || '未知品項'; const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0 ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') : '無'; const notes = item.notes ? `備註: ${item.notes}` : ''; return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim(); }).join('\n\n'); const values = [[ orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), orderData.table, orderData.headcount, orderData.totalAmount, orderData.fee, orderData.finalAmount, itemDetailsString ]]; await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A:F`, valueInputOption: 'USER_ENTERED', resource: { values } }); console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`); }
+async function appendOrderToGoogleSheet(orderData) { const auth = getGoogleAuth(); if (!process.env.GOOGLE_SHEET_ID || !auth) { console.log("未設定 Google Sheet ID 或憑證，跳過寫入。"); return; } const sheets = google.sheets({ version: 'v4', auth }); const today = new Date(); const timezoneOffset = -480; const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000); const sheetName = localToday.toISOString().split('T')[0]; try { const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID }); const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName); if (!sheetExists) { await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SHEET_ID, resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] } }); await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', resource: { values: [['訂單ID', '下單時間', '桌號', '人數', '餐點總計', '手續費', '最終金額', '餐點詳情']] } }); console.log(`已建立新的每日工作表: ${sheetName}`); } } catch (err) { console.error("檢查或建立工作表時發生錯誤:", err); } const t = translations['zh']; const itemDetailsString = orderData.items.map(item => { const name = item.name?.zh || '未知品項'; const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0 ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') : '無'; const notes = item.notes ? `備註: ${item.notes}` : ''; return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim(); }).join('\n\n'); const values = [[ orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), orderData.table, orderData.headcount, orderData.totalAmount, orderData.fee, orderData.finalAmount, itemDetailsString ]]; await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A:H`, valueInputOption: 'USER_ENTERED', resource: { values } }); console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`); }
 
 // --- API 端點 ---
 
-// 【全新】新增根路徑的健康檢查 API
 app.get('/', (req, res) => {
     res.status(200).send('Backend is alive and running!');
 });
@@ -48,10 +63,7 @@ app.get('/api/menu', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM menu_items ORDER BY id');
         const menu = { limited: [], main: [], side: [], drink: [], dessert: [] };
-        const formattedItems = result.rows.map(item => ({
-            ...item,
-            options: item.options ? item.options.split(',').filter(opt => opt) : []
-        }));
+        const formattedItems = result.rows.map(item => ({ ...item, options: item.options ? item.options.split(',').filter(opt => opt) : [] }));
         formattedItems.forEach(item => {
             if (menu[item.category]) {
                 menu[item.category].push(item);
@@ -69,20 +81,13 @@ app.get('/api/settings', async (req, res) => {
         const settings = settingsResult.rows.reduce((acc, row) => {
             let value = row.setting_value;
             if (row.setting_key === 'transactionFeePercent') value = Number(value);
-            if (row.setting_key === 'useLogo' || row.setting_key === 'isAiEnabled' || row.setting_key === 'saveToGoogleSheet' || row.setting_key === 'saveToDatabase') value = (value === 'true');
+            if (['useLogo', 'isAiEnabled', 'saveToGoogleSheet', 'saveToDatabase'].includes(row.setting_key)) value = (value === 'true');
             acc[row.setting_key] = value;
             return acc;
         }, {});
 
         settings.announcements = announcementsResult.rows;
-
-        res.json({
-            isAiEnabled: settings.isAiEnabled && !!genAI,
-            useLogo: settings.useLogo,
-            logoUrl: settings.logoUrl,
-            transactionFeePercent: settings.transactionFeePercent,
-            announcements: settings.announcements,
-        });
+        res.json(settings);
     } catch (err) {
         console.error('讀取設定時發生錯誤', err);
         res.status(500).json({ message: '讀取設定時發生錯誤' });
@@ -119,7 +124,6 @@ app.post('/api/orders', async (req, res) => {
             const orderResult = await client.query(orderInsertQuery, [tableNumber, headcount, totalAmount, fee, finalAmount, 'received']);
             newOrderId = orderResult.rows[0].id;
             orderTimestamp = orderResult.rows[0].created_at;
-
             for (const item of items) {
                 const orderItemInsertQuery = `INSERT INTO order_items (order_id, menu_item_id, quantity, notes) VALUES ($1, $2, $3, $4)`;
                 await client.query(orderItemInsertQuery, [newOrderId, item.id, item.quantity, item.notes]);
@@ -136,10 +140,7 @@ app.post('/api/orders', async (req, res) => {
         }
         
         if (shouldSaveToSheet) {
-            await appendOrderToGoogleSheet({
-              orderId: newOrderId, timestamp: orderTimestamp, table: tableNumber, headcount,
-              totalAmount, fee, finalAmount, items 
-            });
+            await appendOrderToGoogleSheet({ orderId: newOrderId, timestamp: orderTimestamp, table: tableNumber, headcount, totalAmount, fee, finalAmount, items });
         }
         
         res.status(201).json({ message: '訂單已成功接收！', orderId: newOrderId });
@@ -188,7 +189,7 @@ app.get('/api/admin/settings', async (req, res) => {
         const settings = settingsResult.rows.reduce((acc, row) => {
             let value = row.setting_value;
             if (row.setting_key === 'transactionFeePercent') value = Number(value);
-            if (row.setting_key === 'useLogo' || row.setting_key === 'isAiEnabled' || row.setting_key === 'saveToGoogleSheet' || row.setting_key === 'saveToDatabase') value = (value === 'true');
+            if (['useLogo', 'isAiEnabled', 'saveToGoogleSheet', 'saveToDatabase'].includes(row.setting_key)) value = (value === 'true');
             acc[row.setting_key] = value;
             return acc;
         }, {});
@@ -219,17 +220,19 @@ app.put('/api/admin/settings', async (req, res) => {
 });
 
 app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => {
-    if (!req.file) return res.status(400).send('No file uploaded.');
-    if (!process.env.IMGUR_CLIENT_ID) return res.status(500).json({ message: '未設定 Imgur Client ID' });
+    if (!req.file) {
+        return res.status(400).send('No file uploaded.');
+    }
+    if (!process.env.IMGBB_API_KEY) {
+        return res.status(500).json({ message: '未設定 ImgBB API 金鑰' });
+    }
     try {
         const formData = new FormData();
-        formData.append('image', req.file.buffer, { filename: req.file.originalname });
-        const response = await axios.post('https://api.imgur.com/3/image', formData, {
-            headers: { 'Authorization': `Client-ID ${process.env.IMGUR_CLIENT_ID}` }
-        });
-        res.json({ imageUrl: response.data.data.link });
+        formData.append('image', req.file.buffer.toString('base64'));
+        const response = await axios.post(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`, formData);
+        res.json({ imageUrl: response.data.data.url });
     } catch (error) {
-        console.error('Imgur upload error:', error.response ? error.response.data : error.message);
+        console.error('ImgBB upload error:', error.response ? error.response.data : error.message);
         res.status(500).json({ message: '圖片上傳失敗' });
     }
 });
@@ -324,4 +327,4 @@ app.delete('/api/menu_items/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`後端伺服器 (v24) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v25) 正在 http://localhost:${PORT} 上運行`));
