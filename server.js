@@ -1,4 +1,4 @@
-// --- server.js (v26 - 加入 AI 請求重試機制) ---
+// --- server.js (v27 - AI 優雅降級 & 健康檢查) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -49,32 +49,33 @@ app.use(express.json());
 // --- 輔助函式 ---
 
 /**
- * 【全新】帶有重試機制的 AI 內容生成函式
+ * 帶有重試機制的 AI 內容生成函式
  * @param {GenerativeModel} model - Gemini 模型實例
  * @param {string} prompt - 要傳送給 AI 的提示
  * @param {number} retries - 最大重試次數
  * @param {number} delay - 初始延遲時間 (毫秒)
- * @returns {Promise<string>} - AI 生成的文字內容
+ * @returns {Promise<{success: boolean, text: string}>} - AI 生成的結果物件
  */
 async function generateContentWithRetry(model, prompt, retries = 3, delay = 1000) {
     for (let i = 0; i < retries; i++) {
         try {
             const result = await model.generateContent(prompt);
-            return result.response.text();
+            return { success: true, text: result.response.text() };
         } catch (error) {
-            // 只在收到 503 錯誤時重試
             if (error.message && error.message.includes('503')) {
                 console.warn(`AI 請求失敗 (第 ${i + 1} 次)，原因：伺服器超載。將在 ${delay / 1000} 秒後重試...`);
-                await new Promise(res => setTimeout(res, delay));
-                delay *= 2; // 下次重試的延遲時間加倍
+                if (i < retries - 1) {
+                    await new Promise(res => setTimeout(res, delay));
+                    delay *= 2;
+                }
             } else {
                 // 如果是其他錯誤，直接拋出
                 throw error;
             }
         }
     }
-    // 如果重試全部失敗，拋出最終錯誤
-    throw new Error('AI 服務持續超載，請稍後再試。');
+    console.error('AI 服務持續超載，將使用備用方案。');
+    return { success: false, text: 'AI service is overloaded.' };
 }
 
 const translations = { zh: { options: { spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" }, sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" }, ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" }, size: { name: "份量", small: "小份", large: "大份" }, }, }, };
@@ -189,10 +190,16 @@ app.post('/api/recommendation', async (req, res) => {
 
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const recommendationText = await generateContentWithRetry(model, prompt);
-        res.json({ recommendation: recommendationText });
+        const result = await generateContentWithRetry(model, prompt);
+        
+        if (result.success) {
+            res.json({ recommendation: result.text });
+        } else {
+            const fallbackResponse = "人氣推薦：試試我們的招牌牛肉麵，或是來杯清爽的珍珠奶茶！";
+            res.json({ recommendation: fallbackResponse });
+        }
     } catch (error) {
-        console.error("呼叫 Gemini API 時發生錯誤:", error);
+        console.error("呼叫 Gemini API 時發生嚴重錯誤:", error);
         res.status(500).json({ error: "無法獲取 AI 推薦，請稍後再試。" });
     }
 });
@@ -288,7 +295,8 @@ app.post('/api/admin/translate-and-add-item', async (req, res) => {
     const { name_zh, description_zh, price, category, image, options } = req.body;
     if (!name_zh || !price || !category) return res.status(400).json({ message: "缺少必要欄位：中文名稱、價格、分類。" });
 
-    let aiResponseText = "N/A";
+    let name, description;
+
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const prompt = `Translate the following JSON object values from Traditional Chinese to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko".
@@ -299,15 +307,20 @@ Input:
 }
 Output:`;
         
-        aiResponseText = await generateContentWithRetry(model, prompt);
+        const result = await generateContentWithRetry(model, prompt);
 
-        const jsonMatch = aiResponseText.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("AI did not return a valid JSON object.");
-        const jsonString = jsonMatch[0];
-        const translated = JSON.parse(jsonString);
-
-        const name = { zh: name_zh, en: translated.en?.name || name_zh, ja: translated.ja?.name || name_zh, ko: translated.ko?.name || name_zh };
-        const description = { zh: description_zh, en: translated.en?.description || description_zh, ja: translated.ja?.description || description_zh, ko: translated.ko?.description || description_zh };
+        if (result.success) {
+            const jsonMatch = result.text.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) throw new Error("AI did not return a valid JSON object.");
+            const jsonString = jsonMatch[0];
+            const translated = JSON.parse(jsonString);
+            name = { zh: name_zh, en: translated.en?.name || name_zh, ja: translated.ja?.name || name_zh, ko: translated.ko?.name || name_zh };
+            description = { zh: description_zh, en: translated.en?.description || description_zh, ja: translated.ja?.description || description_zh, ko: translated.ko?.description || description_zh };
+        } else {
+            console.warn("AI 翻譯失敗，將使用中文作為所有語言的預設值。");
+            name = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh };
+            description = { zh: description_zh, en: description_zh, ja: description_zh, ko: description_zh };
+        }
 
         const query = 'INSERT INTO menu_items (name, price, image, description, category, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
         const values = [name, price, image, description, category, options];
@@ -316,7 +329,7 @@ Output:`;
         res.status(201).json(dbResult.rows[0]);
 
     } catch (error) {
-        console.error("新增餐點並翻譯時發生錯誤:", { errorMessage: error.message, originalRequestBody: req.body, aiRawResponse: aiResponseText, errorStack: error.stack });
+        console.error("新增餐點並翻譯時發生錯誤:", { errorMessage: error.message, originalRequestBody: req.body, errorStack: error.stack });
         res.status(500).json({ message: "新增餐點失敗，請檢查後端日誌。" });
     }
 });
@@ -348,4 +361,4 @@ app.delete('/api/menu_items/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`後端伺服器 (v26) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v27) 正在 http://localhost:${PORT} 上運行`));
