@@ -1,4 +1,4 @@
-// --- server.js (v25 - 改用 ImgBB 圖片上傳) ---
+// --- server.js (v26 - 加入 AI 請求重試機制) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -47,6 +47,36 @@ app.use(cors());
 app.use(express.json());
 
 // --- 輔助函式 ---
+
+/**
+ * 【全新】帶有重試機制的 AI 內容生成函式
+ * @param {GenerativeModel} model - Gemini 模型實例
+ * @param {string} prompt - 要傳送給 AI 的提示
+ * @param {number} retries - 最大重試次數
+ * @param {number} delay - 初始延遲時間 (毫秒)
+ * @returns {Promise<string>} - AI 生成的文字內容
+ */
+async function generateContentWithRetry(model, prompt, retries = 3, delay = 1000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const result = await model.generateContent(prompt);
+            return result.response.text();
+        } catch (error) {
+            // 只在收到 503 錯誤時重試
+            if (error.message && error.message.includes('503')) {
+                console.warn(`AI 請求失敗 (第 ${i + 1} 次)，原因：伺服器超載。將在 ${delay / 1000} 秒後重試...`);
+                await new Promise(res => setTimeout(res, delay));
+                delay *= 2; // 下次重試的延遲時間加倍
+            } else {
+                // 如果是其他錯誤，直接拋出
+                throw error;
+            }
+        }
+    }
+    // 如果重試全部失敗，拋出最終錯誤
+    throw new Error('AI 服務持續超載，請稍後再試。');
+}
+
 const translations = { zh: { options: { spice: { name: "辣度", none: "不辣", mild: "小辣", medium: "中辣", hot: "大辣" }, sugar: { name: "甜度", full: "正常糖", less: "少糖", half: "半糖", quarter: "微糖", none: "無糖" }, ice: { name: "冰塊", regular: "正常冰", less: "少冰", none: "去冰" }, size: { name: "份量", small: "小份", large: "大份" }, }, }, };
 function formatOrderForNotification(order) { let message = `🔔 新訂單通知！(單號 #${order.orderId})\n桌號: ${order.tableNumber}\n人數: ${order.headcount}\n-------------------\n`; order.items.forEach(item => { const itemName = item.name?.zh || item.name; message += `‣ ${itemName} x ${item.quantity}\n`; if (item.notes) { message += `  備註: ${item.notes}\n`; } }); message += `-------------------\n總金額 (含手續費): NT$ ${order.finalAmount}`; return message; }
 async function sendLineMessage(userId, message) { if(!lineClient) return; try { await lineClient.pushMessage(userId, { type: 'text', text: message }); console.log("LINE 訊息已發送至:", userId); } catch (error) { console.error("發送 LINE 訊息失敗:", error.originalError ? error.originalError.response.data : error); } }
@@ -70,14 +100,16 @@ app.get('/api/menu', async (req, res) => {
             }
         });
         res.json(menu);
-    } catch (err) { res.status(500).send('伺服器錯誤'); }
+    } catch (err) {
+        console.error('查詢菜單時發生錯誤:', err);
+        res.status(500).send('伺服器錯誤');
+    }
 });
 
 app.get('/api/settings', async (req, res) => {
     try {
         const settingsResult = await pool.query('SELECT * FROM app_settings');
         const announcementsResult = await pool.query('SELECT * FROM announcements ORDER BY sort_order ASC');
-        
         const settings = settingsResult.rows.reduce((acc, row) => {
             let value = row.setting_value;
             if (row.setting_key === 'transactionFeePercent') value = Number(value);
@@ -85,7 +117,6 @@ app.get('/api/settings', async (req, res) => {
             acc[row.setting_key] = value;
             return acc;
         }, {});
-
         settings.announcements = announcementsResult.rows;
         res.json(settings);
     } catch (err) {
@@ -99,7 +130,6 @@ app.post('/api/orders', async (req, res) => {
     if (!tableNumber || !headcount || totalAmount === undefined || !items || !Array.isArray(items)) {
         return res.status(400).json({ message: '訂單資料不完整或格式錯誤。' });
     }
-
     const client = await pool.connect();
     try {
         const settingsResult = await client.query("SELECT * FROM app_settings");
@@ -107,17 +137,13 @@ app.post('/api/orders', async (req, res) => {
             acc[row.setting_key] = row.setting_value === 'true';
             return acc;
         }, {});
-
         const shouldSaveToSheet = settings.saveToGoogleSheet === true;
         const shouldSaveToDatabase = settings.saveToDatabase === true;
-
         if (!shouldSaveToDatabase && !shouldSaveToSheet) {
             return res.status(400).json({ message: '沒有設定任何訂單儲存方式，無法處理訂單。' });
         }
-
         let newOrderId = 'N/A';
         let orderTimestamp = new Date();
-
         if (shouldSaveToDatabase) {
             await client.query('BEGIN');
             const orderInsertQuery = 'INSERT INTO orders (table_number, headcount, total_amount, fee, final_amount, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at';
@@ -133,16 +159,13 @@ app.post('/api/orders', async (req, res) => {
         } else {
             newOrderId = `GS-${Date.now()}`;
         }
-        
         const notificationMessage = formatOrderForNotification({ ...req.body, orderId: newOrderId, finalAmount });
         if (lineClient && process.env.LINE_USER_ID) {
             sendLineMessage(process.env.LINE_USER_ID, notificationMessage);
         }
-        
         if (shouldSaveToSheet) {
             await appendOrderToGoogleSheet({ orderId: newOrderId, timestamp: orderTimestamp, table: tableNumber, headcount, totalAmount, fee, finalAmount, items });
         }
-        
         res.status(201).json({ message: '訂單已成功接收！', orderId: newOrderId });
     } catch (err) {
         if (client) await client.query('ROLLBACK');
@@ -156,19 +179,21 @@ app.post('/api/orders', async (req, res) => {
 app.post('/api/recommendation', async (req, res) => {
     const { language, cartItems, availableItems } = req.body;
     if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
+    
     let prompt;
     if (!cartItems || cartItems.length === 0) {
         prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user's cart is empty. Please recommend 2-3 popular starting items or appetizers from the menu to get them started. Be enticing and friendly. Here is the list of available menu items to choose from: ${availableItems}.`;
     } else {
         prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
     }
+
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const result = await model.generateContent(prompt);
-        res.json({ recommendation: result.response.text() });
+        const recommendationText = await generateContentWithRetry(model, prompt);
+        res.json({ recommendation: recommendationText });
     } catch (error) {
         console.error("呼叫 Gemini API 時發生錯誤:", error);
-        res.status(500).json({ error: "無法獲取 AI 推薦" });
+        res.status(500).json({ error: "無法獲取 AI 推薦，請稍後再試。" });
     }
 });
 
@@ -220,9 +245,7 @@ app.put('/api/admin/settings', async (req, res) => {
 });
 
 app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
-    }
+    if (!req.file) return res.status(400).send('No file uploaded.');
     if (!process.env.IMGBB_API_KEY) {
         return res.status(500).json({ message: '未設定 ImgBB API 金鑰' });
     }
@@ -237,7 +260,6 @@ app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => 
     }
 });
 
-// 公告管理 API (CRUD)
 app.get('/api/admin/announcements', async (req, res) => {
     const result = await pool.query('SELECT * FROM announcements ORDER BY sort_order ASC');
     res.json(result.rows);
@@ -261,7 +283,6 @@ app.delete('/api/admin/announcements/:id', async (req, res) => {
     res.status(204).send();
 });
 
-// AI 翻譯並新增餐點的 API
 app.post('/api/admin/translate-and-add-item', async (req, res) => {
     if (!genAI) return res.status(503).json({ message: "AI 翻譯功能未啟用。" });
     const { name_zh, description_zh, price, category, image, options } = req.body;
@@ -277,9 +298,9 @@ Input:
   "description": "${description_zh || ' '}"
 }
 Output:`;
+        
+        aiResponseText = await generateContentWithRetry(model, prompt);
 
-        const result = await model.generateContent(prompt);
-        aiResponseText = result.response.text();
         const jsonMatch = aiResponseText.match(/\{[\s\S]*\}/);
         if (!jsonMatch) throw new Error("AI did not return a valid JSON object.");
         const jsonString = jsonMatch[0];
@@ -327,4 +348,4 @@ app.delete('/api/menu_items/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`後端伺服器 (v25) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v26) 正在 http://localhost:${PORT} 上運行`));
