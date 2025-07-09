@@ -1,4 +1,4 @@
-// --- server.js (v28 - 分類管理與主題外觀) ---
+// --- server.js (v29 - 排序與錯誤處理修正) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -44,7 +44,7 @@ app.get('/api/menu', async (req, res) => {
         });
 
         itemsResult.rows.forEach(item => {
-            if (menu[item.category_key]) {
+            if (item.category_key && menu[item.category_key]) {
                 menu[item.category_key].push({
                     ...item,
                     options: item.options ? item.options.split(',').filter(opt => opt) : []
@@ -157,244 +157,58 @@ app.post('/api/recommendation', async (req, res) => {
 
 // --- 後台管理 API ---
 
-app.post('/api/admin/login', (req, res) => {
-    const { password } = req.body;
-    if (password && password === process.env.ADMIN_PASSWORD) {
-        res.status(200).json({ message: '登入成功' });
-    } else {
-        res.status(401).json({ message: '密碼錯誤' });
-    }
-});
-
-app.get('/api/admin/settings', async (req, res) => {
-    try {
-        const settingsResult = await pool.query('SELECT * FROM app_settings');
-        const settings = settingsResult.rows.reduce((acc, row) => {
-            let value = row.setting_value;
-            if (row.setting_key === 'transactionFeePercent') value = Number(value);
-            if (['useLogo', 'isAiEnabled', 'saveToGoogleSheet', 'saveToDatabase'].includes(row.setting_key)) value = (value === 'true');
-            acc[row.setting_key] = value;
-            return acc;
-        }, {});
-        res.json(settings);
-    } catch (err) {
-        res.status(500).json({ message: '讀取設定錯誤' });
-    }
-});
-
-app.put('/api/admin/settings', async (req, res) => {
-    const settingsToUpdate = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        for (const [key, value] of Object.entries(settingsToUpdate)) {
-            const query = `INSERT INTO app_settings (setting_key, setting_value) VALUES ($1, $2) ON CONFLICT (setting_key) DO UPDATE SET setting_value = $2;`;
-            await client.query(query, [key, String(value)]);
-        }
-        await client.query('COMMIT');
-        res.status(200).json({ message: '設定已更新' });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error('更新設定時發生錯誤', err);
-        res.status(500).json({ message: '更新設定時發生錯誤' });
-    } finally {
-        client.release();
-    }
-});
-
-app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => {
-    if (!req.file) return res.status(400).send('No file uploaded.');
-    if (!process.env.IMGBB_API_KEY) {
-        return res.status(500).json({ message: '未設定 ImgBB API 金鑰' });
-    }
-    try {
-        const formData = new FormData();
-        formData.append('image', req.file.buffer.toString('base64'));
-        const response = await axios.post(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`, formData);
-        res.json({ imageUrl: response.data.data.url });
-    } catch (error) {
-        console.error('ImgBB upload error:', error.response ? error.response.data : error.message);
-        res.status(500).json({ message: '圖片上傳失敗' });
-    }
-});
+app.post('/api/admin/login', (req, res) => { const { password } = req.body; if (password && password === process.env.ADMIN_PASSWORD) { res.status(200).json({ message: '登入成功' }); } else { res.status(401).json({ message: '密碼錯誤' }); } });
+app.get('/api/admin/settings', async (req, res) => { try { const settingsResult = await pool.query('SELECT * FROM app_settings'); const settings = settingsResult.rows.reduce((acc, row) => { let value = row.setting_value; if (row.setting_key === 'transactionFeePercent') value = Number(value); if (['useLogo', 'isAiEnabled', 'saveToGoogleSheet', 'saveToDatabase'].includes(row.setting_key)) value = (value === 'true'); acc[row.setting_key] = value; return acc; }, {}); res.json(settings); } catch (err) { res.status(500).json({ message: '讀取設定錯誤' }); } });
+app.put('/api/admin/settings', async (req, res) => { const settingsToUpdate = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); for (const [key, value] of Object.entries(settingsToUpdate)) { const query = `INSERT INTO app_settings (setting_key, setting_value) VALUES ($1, $2) ON CONFLICT (setting_key) DO UPDATE SET setting_value = $2;`; await client.query(query, [key, String(value)]); } await client.query('COMMIT'); res.status(200).json({ message: '設定已更新' }); } catch (err) { await client.query('ROLLBACK'); console.error('更新設定時發生錯誤', err); res.status(500).json({ message: '更新設定時發生錯誤' }); } finally { client.release(); } });
+app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => { if (!req.file) return res.status(400).send('No file uploaded.'); if (!process.env.IMGBB_API_KEY) { return res.status(500).json({ message: '未設定 ImgBB API 金鑰' }); } try { const formData = new FormData(); formData.append('image', req.file.buffer.toString('base64')); const response = await axios.post(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`, formData); res.json({ imageUrl: response.data.data.url }); } catch (error) { console.error('ImgBB upload error:', error.response ? error.response.data : error.message); res.status(500).json({ message: '圖片上傳失敗' }); } });
 
 // 公告管理 API (CRUD)
-app.get('/api/admin/announcements', async (req, res) => {
-    const result = await pool.query('SELECT * FROM announcements ORDER BY sort_order ASC');
-    res.json(result.rows);
-});
-app.post('/api/admin/announcements', async (req, res) => {
-    const { image, text } = req.body;
-    const result = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM announcements');
-    const newOrder = result.rows[0].max_order + 1;
-    const insertResult = await pool.query('INSERT INTO announcements (image, text, sort_order) VALUES ($1, $2, $3) RETURNING *', [image, text, newOrder]);
-    res.status(201).json(insertResult.rows[0]);
-});
-app.put('/api/admin/announcements/:id', async (req, res) => {
-    const { id } = req.params;
-    const { image, text } = req.body;
-    const result = await pool.query('UPDATE announcements SET image = $1, text = $2 WHERE id = $3 RETURNING *', [image, text, id]);
-    res.json(result.rows[0]);
-});
-app.delete('/api/admin/announcements/:id', async (req, res) => {
-    const { id } = req.params;
-    await pool.query('DELETE FROM announcements WHERE id = $1', [id]);
-    res.status(204).send();
-});
-app.put('/api/admin/announcements/order', async (req, res) => {
-    const { orderedAnnouncements } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        for (const [index, ann] of orderedAnnouncements.entries()) {
-            await client.query('UPDATE announcements SET sort_order = $1 WHERE id = $2', [index + 1, ann.id]);
-        }
-        await client.query('COMMIT');
-        res.status(200).json({ message: '順序已更新' });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ message: '更新順序失敗' });
-    } finally {
-        client.release();
-    }
-});
+app.get('/api/admin/announcements', async (req, res) => { const result = await pool.query('SELECT * FROM announcements ORDER BY sort_order ASC'); res.json(result.rows); });
+app.post('/api/admin/announcements', async (req, res) => { const { image, text } = req.body; const result = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM announcements'); const newOrder = result.rows[0].max_order + 1; const insertResult = await pool.query('INSERT INTO announcements (image, text, sort_order) VALUES ($1, $2, $3) RETURNING *', [image, text, newOrder]); res.status(201).json(insertResult.rows[0]); });
+app.put('/api/admin/announcements/:id', async (req, res) => { const { id } = req.params; const { image, text } = req.body; const result = await pool.query('UPDATE announcements SET image = $1, text = $2 WHERE id = $3 RETURNING *', [image, text, id]); res.json(result.rows[0]); });
+app.delete('/api/admin/announcements/:id', async (req, res) => { const { id } = req.params; await pool.query('DELETE FROM announcements WHERE id = $1', [id]); res.status(204).send(); });
+app.put('/api/admin/announcements/order', async (req, res) => { const { orderedIds } = req.body; if (!Array.isArray(orderedIds)) { return res.status(400).json({ message: 'Invalid data format' }); } const client = await pool.connect(); try { await client.query('BEGIN'); for (let i = 0; i < orderedIds.length; i++) { const id = orderedIds[i]; const sortOrder = i + 1; await client.query('UPDATE announcements SET sort_order = $1 WHERE id = $2', [sortOrder, id]); } await client.query('COMMIT'); res.status(200).json({ message: '順序已更新' }); } catch (error) { await client.query('ROLLBACK'); console.error('更新公告順序時發生錯誤:', error); res.status(500).json({ message: '更新順序失敗' }); } finally { client.release(); } });
 
 // 分類管理 API (CRUD)
-app.get('/api/admin/categories', async (req, res) => {
-    const result = await pool.query('SELECT * FROM categories ORDER BY sort_order ASC');
-    res.json(result.rows);
-});
-app.post('/api/admin/categories', async (req, res) => {
-    const { key, name_zh } = req.body;
-    if (!key || !name_zh) return res.status(400).json({ message: "分類 Key 和中文名稱為必填項。" });
-    try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const prompt = `Translate "${name_zh}" to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko". Example: {"en": "Main Course", "ja": "メイン", "ko": "메인 요리"}`;
-        const result = await generateContentWithRetry(model, prompt);
-        let name;
-        if (result.success) {
-            const jsonMatch = result.text.match(/\{[\s\S]*\}/);
-            const jsonString = jsonMatch ? jsonMatch[0] : '{}';
-            const translated = JSON.parse(jsonString);
-            name = { zh: name_zh, en: translated.en || name_zh, ja: translated.ja || name_zh, ko: translated.ko || name_zh };
-        } else {
-            name = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh };
-        }
-        const maxOrderResult = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM categories');
-        const newOrder = maxOrderResult.rows[0].max_order + 1;
-        const insertResult = await pool.query('INSERT INTO categories (key, name, sort_order) VALUES ($1, $2, $3) RETURNING *', [key.toLowerCase().replace(/\s/g, '-'), name, newOrder]);
-        res.status(201).json(insertResult.rows[0]);
-    } catch (error) {
-        console.error("新增分類時發生錯誤:", error);
-        if (error.code === '23505') {
-            return res.status(400).json({ message: `分類 Key "${key}" 已存在，請使用不同的 Key。` });
-        }
-        res.status(500).json({ message: "新增分類失敗" });
-    }
-});
-app.put('/api/admin/categories/:id', async (req, res) => {
-    const { id } = req.params;
-    const { key, name } = req.body; // Assuming name is a full JSONB object
-    try {
-        const result = await pool.query('UPDATE categories SET key = $1, name = $2 WHERE id = $3 RETURNING *', [key, name, id]);
-        res.json(result.rows[0]);
-    } catch (error) {
-        console.error('更新分類時發生錯誤:', error);
-        res.status(500).json({ message: "更新分類失敗" });
-    }
-});
+app.get('/api/admin/categories', async (req, res) => { const result = await pool.query('SELECT * FROM categories ORDER BY sort_order ASC'); res.json(result.rows); });
+app.post('/api/admin/categories', async (req, res) => { const { key, name_zh } = req.body; if (!key || !name_zh) return res.status(400).json({ message: "分類 Key 和中文名稱為必填項。" }); try { const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); const prompt = `Translate "${name_zh}" to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko". Example: {"en": "Main Course", "ja": "メイン", "ko": "메인 요리"}`; const result = await generateContentWithRetry(model, prompt); let name; if (result.success) { const jsonMatch = result.text.match(/\{[\s\S]*\}/); const jsonString = jsonMatch ? jsonMatch[0] : '{}'; const translated = JSON.parse(jsonString); name = { zh: name_zh, en: translated.en || name_zh, ja: translated.ja || name_zh, ko: translated.ko || name_zh }; } else { name = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh }; } const maxOrderResult = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM categories'); const newOrder = maxOrderResult.rows[0].max_order + 1; const insertResult = await pool.query('INSERT INTO categories (key, name, sort_order) VALUES ($1, $2, $3) RETURNING *', [key.toLowerCase().replace(/\s/g, '-'), name, newOrder]); res.status(201).json(insertResult.rows[0]); } catch (error) { console.error("新增分類時發生錯誤:", error); if (error.code === '23505') { return res.status(400).json({ message: `分類 Key "${key}" 已存在，請使用不同的 Key。` }); } res.status(500).json({ message: "新增分類失敗" }); } });
+app.put('/api/admin/categories/:id', async (req, res) => { const { id } = req.params; const { key, name } = req.body; try { const result = await pool.query('UPDATE categories SET key = $1, name = $2 WHERE id = $3 RETURNING *', [key, name, id]); res.json(result.rows[0]); } catch (error) { console.error('更新分類時發生錯誤:', error); res.status(500).json({ message: "更新分類失敗" }); } });
+
+// 【修正】分類排序 API
 app.put('/api/admin/categories/order', async (req, res) => {
-    const { orderedCategories } = req.body;
+    const { orderedIds } = req.body;
+    console.log('Received request to reorder categories. IDs:', orderedIds); // 增加日誌
+    if (!Array.isArray(orderedIds)) {
+        return res.status(400).json({ message: '無效的資料格式，預期為 ID 陣列。' });
+    }
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        for (const [index, cat] of orderedCategories.entries()) {
-            await client.query('UPDATE categories SET sort_order = $1 WHERE id = $2', [index + 1, cat.id]);
+        for (let i = 0; i < orderedIds.length; i++) {
+            const id = parseInt(orderedIds[i], 10);
+            const sortOrder = i + 1;
+            if (isNaN(id)) {
+                throw new Error(`無效的分類 ID: ${orderedIds[i]}`);
+            }
+            await client.query('UPDATE categories SET sort_order = $1 WHERE id = $2', [sortOrder, id]);
         }
         await client.query('COMMIT');
         res.status(200).json({ message: '順序已更新' });
     } catch (error) {
         await client.query('ROLLBACK');
+        console.error('更新分類順序時發生錯誤:', error);
         res.status(500).json({ message: '更新順序失敗' });
     } finally {
         client.release();
     }
 });
-app.delete('/api/admin/categories/:id', async (req, res) => {
-    const { id } = req.params;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const catResult = await client.query('SELECT key FROM categories WHERE id = $1', [id]);
-        const catKey = catResult.rows[0]?.key;
-        if (catKey) {
-            await client.query('UPDATE menu_items SET category_key = NULL WHERE category_key = $1', [catKey]);
-        }
-        await client.query('DELETE FROM categories WHERE id = $1', [id]);
-        await client.query('COMMIT');
-        res.status(204).send();
-    } catch (error) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ message: '刪除分類失敗' });
-    } finally {
-        client.release();
-    }
-});
+
+app.delete('/api/admin/categories/:id', async (req, res) => { const { id } = req.params; const client = await pool.connect(); try { await client.query('BEGIN'); const catResult = await client.query('SELECT key FROM categories WHERE id = $1', [id]); const catKey = catResult.rows[0]?.key; if (catKey) { await client.query('UPDATE menu_items SET category_key = NULL WHERE category_key = $1', [catKey]); } await client.query('DELETE FROM categories WHERE id = $1', [id]); await client.query('COMMIT'); res.status(204).send(); } catch (error) { await client.query('ROLLBACK'); res.status(500).json({ message: '刪除分類失敗' }); } finally { client.release(); } });
 
 // 菜單品項管理 API
-app.post('/api/admin/translate-and-add-item', async (req, res) => {
-    if (!genAI) return res.status(503).json({ message: "AI 翻譯功能未啟用。" });
-    const { name_zh, description_zh, price, category_key, image, options } = req.body;
-    if (!name_zh || !price || !category_key) return res.status(400).json({ message: "缺少必要欄位：中文名稱、價格、分類。" });
-    let name, description;
-    try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const prompt = `Translate the following JSON object values from Traditional Chinese to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko". Input: { "name": "${name_zh}", "description": "${description_zh || ' '}" } Output:`;
-        const result = await generateContentWithRetry(model, prompt);
-        if (result.success) {
-            const jsonMatch = result.text.match(/\{[\s\S]*\}/);
-            const jsonString = jsonMatch ? jsonMatch[0] : '{}';
-            const translated = JSON.parse(jsonString);
-            name = { zh: name_zh, en: translated.en?.name || name_zh, ja: translated.ja?.name || name_zh, ko: translated.ko?.name || name_zh };
-            description = { zh: description_zh, en: translated.en?.description || description_zh, ja: translated.ja?.description || description_zh, ko: translated.ko?.description || description_zh };
-        } else {
-            console.warn("AI 翻譯失敗，將使用中文作為所有語言的預設值。");
-            name = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh };
-            description = { zh: description_zh, en: description_zh, ja: description_zh, ko: description_zh };
-        }
-        const query = 'INSERT INTO menu_items (name, price, image, description, category_key, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
-        const values = [name, price, image, description, category_key, options];
-        const dbResult = await pool.query(query, values);
-        res.status(201).json(dbResult.rows[0]);
-    } catch (error) {
-        console.error("新增餐點並翻譯時發生錯誤:", { errorMessage: error.message, originalRequestBody: req.body, errorStack: error.stack });
-        res.status(500).json({ message: "新增餐點失敗，請檢查後端日誌。" });
-    }
-});
-app.put('/api/menu_items/:id', async (req, res) => {
-    const { id } = req.params;
-    const { name, price, image, description, category_key, options } = req.body;
-    const query = 'UPDATE menu_items SET name=$1, price=$2, image=$3, description=$4, category_key=$5, options=$6 WHERE id=$7 RETURNING *';
-    const values = [name, price, image, description, category_key, options, id];
-    try {
-        const result = await pool.query(query, values);
-        res.status(200).json(result.rows[0]);
-    } catch (err) {
-        console.error('更新品項時發生錯誤:', err);
-        res.status(500).json({ message: '更新品項失敗' });
-    }
-});
-app.delete('/api/menu_items/:id', async (req, res) => {
-    const { id } = req.params;
-    try {
-        await pool.query('DELETE FROM order_items WHERE menu_item_id=$1', [id]);
-        await pool.query('DELETE FROM menu_items WHERE id=$1', [id]);
-        res.status(204).send();
-    } catch (err) {
-        console.error('刪除品項時發生錯誤:', err);
-        res.status(500).json({ message: '刪除品項失敗' });
-    }
-});
+app.post('/api/admin/translate-and-add-item', async (req, res) => { if (!genAI) return res.status(503).json({ message: "AI 翻譯功能未啟用。" }); const { name_zh, description_zh, price, category_key, image, options } = req.body; if (!name_zh || !price || !category_key) return res.status(400).json({ message: "缺少必要欄位：中文名稱、價格、分類。" }); let name, description; try { const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); const prompt = `Translate the following JSON object values from Traditional Chinese to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko". Input: { "name": "${name_zh}", "description": "${description_zh || ' '}" } Output:`; const result = await generateContentWithRetry(model, prompt); if (result.success) { const jsonMatch = result.text.match(/\{[\s\S]*\}/); const jsonString = jsonMatch ? jsonMatch[0] : '{}'; const translated = JSON.parse(jsonString); name = { zh: name_zh, en: translated.en?.name || name_zh, ja: translated.ja?.name || name_zh, ko: translated.ko?.name || name_zh }; description = { zh: description_zh, en: translated.en?.description || description_zh, ja: translated.ja?.description || description_zh, ko: translated.ko?.description || description_zh }; } else { console.warn("AI 翻譯失敗，將使用中文作為所有語言的預設值。"); name = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh }; description = { zh: description_zh, en: description_zh, ja: description_zh, ko: description_zh }; } const query = 'INSERT INTO menu_items (name, price, image, description, category_key, options) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *'; const values = [name, price, image, description, category_key, options]; const dbResult = await pool.query(query, values); res.status(201).json(dbResult.rows[0]); } catch (error) { console.error("新增餐點並翻譯時發生錯誤:", { errorMessage: error.message, originalRequestBody: req.body, errorStack: error.stack }); res.status(500).json({ message: "新增餐點失敗，請檢查後端日誌。" }); } });
+app.put('/api/menu_items/:id', async (req, res) => { const { id } = req.params; const { name, price, image, description, category_key, options } = req.body; const query = 'UPDATE menu_items SET name=$1, price=$2, image=$3, description=$4, category_key=$5, options=$6 WHERE id=$7 RETURNING *'; const values = [name, price, image, description, category_key, options, id]; try { const result = await pool.query(query, values); res.status(200).json(result.rows[0]); } catch (err) { console.error('更新品項時發生錯誤:', err); res.status(500).json({ message: '更新品項失敗' }); } });
+app.delete('/api/menu_items/:id', async (req, res) => { const { id } = req.params; try { await pool.query('DELETE FROM order_items WHERE menu_item_id=$1', [id]); await pool.query('DELETE FROM menu_items WHERE id=$1', [id]); res.status(204).send(); } catch (err) { console.error('刪除品項時發生錯誤:', err); res.status(500).json({ message: '刪除品項失敗' }); } });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`後端伺服器 (v28) 正在 http://localhost:${PORT} 上運行`));
+app.listen(PORT, () => console.log(`後端伺服器 (v29) 正在 http://localhost:${PORT} 上運行`));
