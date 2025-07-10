@@ -1,4 +1,4 @@
-// --- server.js (v30 - 路由順序與後台邏輯修正) ---
+// --- server.js (v29 - 排序與錯誤處理修正) ---
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -28,17 +28,30 @@ async function sendLineMessage(userId, message) { if(!lineClient) return; try { 
 function getGoogleAuth() { if (!process.env.GOOGLE_CREDENTIALS_JSON) return null; try { const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON); return new google.auth.GoogleAuth({ credentials, scopes: 'https://www.googleapis.com/auth/spreadsheets' }); } catch(e) { console.error("無法解析 GOOGLE_CREDENTIALS_JSON:", e); return null; } }
 async function appendOrderToGoogleSheet(orderData) { const auth = getGoogleAuth(); if (!process.env.GOOGLE_SHEET_ID || !auth) { console.log("未設定 Google Sheet ID 或憑證，跳過寫入。"); return; } const sheets = google.sheets({ version: 'v4', auth }); const today = new Date(); const timezoneOffset = -480; const localToday = new Date(today.getTime() - timezoneOffset * 60 * 1000); const sheetName = localToday.toISOString().split('T')[0]; try { const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID }); const sheetExists = spreadsheetInfo.data.sheets.some(s => s.properties.title === sheetName); if (!sheetExists) { await sheets.spreadsheets.batchUpdate({ spreadsheetId: process.env.GOOGLE_SHEET_ID, resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] } }); await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A1`, valueInputOption: 'USER_ENTERED', resource: { values: [['訂單ID', '下單時間', '桌號', '人數', '餐點總計', '手續費', '最終金額', '餐點詳情']] } }); console.log(`已建立新的每日工作表: ${sheetName}`); } } catch (err) { console.error("檢查或建立工作表時發生錯誤:", err); } const t = translations['zh']; const itemDetailsString = orderData.items.map(item => { const name = item.name?.zh || '未知品項'; const options = item.selectedOptions && Object.keys(item.selectedOptions).length > 0 ? Object.entries(item.selectedOptions).map(([key, value]) => t.options[key]?.[value] || value).join(', ') : '無'; const notes = item.notes ? `備註: ${item.notes}` : ''; return `${name} x ${item.quantity}\n選項: ${options}\n${notes}`.trim(); }).join('\n\n'); const values = [[ orderData.orderId, new Date(orderData.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }), orderData.table, orderData.headcount, orderData.totalAmount, orderData.fee, orderData.finalAmount, itemDetailsString ]]; await sheets.spreadsheets.values.append({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: `${sheetName}!A:H`, valueInputOption: 'USER_ENTERED', resource: { values } }); console.log(`訂單 #${orderData.orderId} 已成功寫入工作表: ${sheetName}`); }
 
-// --- 公用 API ---
+// --- API 端點 ---
 app.get('/', (req, res) => res.status(200).send('Backend is alive and running!'));
 
 app.get('/api/menu', async (req, res) => {
     try {
         const categoriesResult = await pool.query('SELECT * FROM categories ORDER BY sort_order ASC');
         const itemsResult = await pool.query('SELECT * FROM menu_items');
+        
         const menu = {};
         const categories = categoriesResult.rows;
-        categories.forEach(cat => { menu[cat.key] = []; });
-        itemsResult.rows.forEach(item => { if (item.category_key && menu[item.category_key]) { menu[item.category_key].push({ ...item, options: item.options ? item.options.split(',').filter(opt => opt) : [] }); } });
+
+        categories.forEach(cat => {
+            menu[cat.key] = [];
+        });
+
+        itemsResult.rows.forEach(item => {
+            if (item.category_key && menu[item.category_key]) {
+                menu[item.category_key].push({
+                    ...item,
+                    options: item.options ? item.options.split(',').filter(opt => opt) : []
+                });
+            }
+        });
+        
         res.json({ menu, categories });
     } catch (err) {
         console.error('查詢菜單時發生錯誤', err);
@@ -50,6 +63,7 @@ app.get('/api/settings', async (req, res) => {
     try {
         const settingsResult = await pool.query('SELECT * FROM app_settings');
         const announcementsResult = await pool.query('SELECT * FROM announcements ORDER BY sort_order ASC');
+        
         const settings = settingsResult.rows.reduce((acc, row) => {
             let value = row.setting_value;
             if (row.setting_key === 'transactionFeePercent') value = Number(value);
@@ -57,6 +71,7 @@ app.get('/api/settings', async (req, res) => {
             acc[row.setting_key] = value;
             return acc;
         }, {});
+
         settings.announcements = announcementsResult.rows;
         res.json(settings);
     } catch (err) {
@@ -73,10 +88,15 @@ app.post('/api/orders', async (req, res) => {
     const client = await pool.connect();
     try {
         const settingsResult = await client.query("SELECT * FROM app_settings");
-        const settings = settingsResult.rows.reduce((acc, row) => { acc[row.setting_key] = row.setting_value === 'true'; return acc; }, {});
+        const settings = settingsResult.rows.reduce((acc, row) => {
+            acc[row.setting_key] = row.setting_value === 'true';
+            return acc;
+        }, {});
         const shouldSaveToSheet = settings.saveToGoogleSheet === true;
         const shouldSaveToDatabase = settings.saveToDatabase === true;
-        if (!shouldSaveToDatabase && !shouldSaveToSheet) { return res.status(400).json({ message: '沒有設定任何訂單儲存方式，無法處理訂單。' }); }
+        if (!shouldSaveToDatabase && !shouldSaveToSheet) {
+            return res.status(400).json({ message: '沒有設定任何訂單儲存方式，無法處理訂單。' });
+        }
         let newOrderId = 'N/A';
         let orderTimestamp = new Date();
         if (shouldSaveToDatabase) {
@@ -91,10 +111,16 @@ app.post('/api/orders', async (req, res) => {
             }
             await client.query('COMMIT');
             console.log(`訂單 #${newOrderId} 已成功儲存至資料庫。`);
-        } else { newOrderId = `GS-${Date.now()}`; }
+        } else {
+            newOrderId = `GS-${Date.now()}`;
+        }
         const notificationMessage = formatOrderForNotification({ ...req.body, orderId: newOrderId, finalAmount });
-        if (lineClient && process.env.LINE_USER_ID) { sendLineMessage(process.env.LINE_USER_ID, notificationMessage); }
-        if (shouldSaveToSheet) { await appendOrderToGoogleSheet({ orderId: newOrderId, timestamp: orderTimestamp, table: tableNumber, headcount, totalAmount, fee, finalAmount, items }); }
+        if (lineClient && process.env.LINE_USER_ID) {
+            sendLineMessage(process.env.LINE_USER_ID, notificationMessage);
+        }
+        if (shouldSaveToSheet) {
+            await appendOrderToGoogleSheet({ orderId: newOrderId, timestamp: orderTimestamp, table: tableNumber, headcount, totalAmount, fee, finalAmount, items });
+        }
         res.status(201).json({ message: '訂單已成功接收！', orderId: newOrderId });
     } catch (err) {
         if (client) await client.query('ROLLBACK');
@@ -109,11 +135,20 @@ app.post('/api/recommendation', async (req, res) => {
     const { language, cartItems, availableItems } = req.body;
     if (!genAI) return res.status(503).json({ error: "AI 功能未啟用或設定錯誤。" });
     let prompt;
-    if (!cartItems || cartItems.length === 0) { prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user's cart is empty. Please recommend 2-3 popular starting items or appetizers from the menu to get them started. Be enticing and friendly. Here is the list of available menu items to choose from: ${availableItems}.`; } else { prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`; }
+    if (!cartItems || cartItems.length === 0) {
+        prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user's cart is empty. Please recommend 2-3 popular starting items or appetizers from the menu to get them started. Be enticing and friendly. Here is the list of available menu items to choose from: ${availableItems}.`;
+    } else {
+        prompt = `You are a friendly restaurant AI assistant. The user's current language is ${language}. Please respond ONLY in ${language}. The user has these items in their cart: ${cartItems}. Based on their cart, suggest one or two additional items from the available menu. Explain briefly and enticingly why they would be a good choice. Do not suggest items already in the cart. Here is the list of available menu items to choose from: ${availableItems}. Keep the response concise, friendly, and formatted as a simple paragraph.`;
+    }
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const result = await generateContentWithRetry(model, prompt);
-        if (result.success) { res.json({ recommendation: result.text }); } else { const fallbackResponse = "人氣推薦：試試我們的招牌牛肉麵，或是來杯清爽的珍珠奶茶！"; res.json({ recommendation: fallbackResponse }); }
+        if (result.success) {
+            res.json({ recommendation: result.text });
+        } else {
+            const fallbackResponse = "人氣推薦：試試我們的招牌牛肉麵，或是來杯清爽的珍珠奶茶！";
+            res.json({ recommendation: fallbackResponse });
+        }
     } catch (error) {
         console.error("呼叫 Gemini API 時發生嚴重錯誤:", error);
         res.status(500).json({ error: "無法獲取 AI 推薦，請稍後再試。" });
@@ -122,10 +157,7 @@ app.post('/api/recommendation', async (req, res) => {
 
 // --- 後台管理 API ---
 
-// 登入
 app.post('/api/admin/login', (req, res) => { const { password } = req.body; if (password && password === process.env.ADMIN_PASSWORD) { res.status(200).json({ message: '登入成功' }); } else { res.status(401).json({ message: '密碼錯誤' }); } });
-
-// 圖片上傳
 app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => { if (!req.file) return res.status(400).send('No file uploaded.'); if (!process.env.IMGBB_API_KEY) { return res.status(500).json({ message: '未設定 ImgBB API 金鑰' }); } try { const formData = new FormData(); formData.append('image', req.file.buffer.toString('base64')); const response = await axios.post(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`, formData); res.json({ imageUrl: response.data.data.url }); } catch (error) { console.error('ImgBB upload error:', error.response ? error.response.data : error.message); res.status(500).json({ message: '圖片上傳失敗' }); } });
 
 // 設定
@@ -139,12 +171,11 @@ app.put('/api/admin/announcements/order', async (req, res) => { const { orderedI
 app.put('/api/admin/announcements/:id', async (req, res) => { const { id } = req.params; const { image, text } = req.body; const result = await pool.query('UPDATE announcements SET image = $1, text = $2 WHERE id = $3 RETURNING *', [image, text, id]); res.json(result.rows[0]); });
 app.delete('/api/admin/announcements/:id', async (req, res) => { const { id } = req.params; await pool.query('DELETE FROM announcements WHERE id = $1', [id]); res.status(204).send(); });
 
-// 【修正】將有 :id 的動態路由，放到通用路由之後，避免路由衝突
 // 分類
 app.get('/api/admin/categories', async (req, res) => { const result = await pool.query('SELECT * FROM categories ORDER BY sort_order ASC'); res.json(result.rows); });
 app.post('/api/admin/categories', async (req, res) => { const { key, name_zh } = req.body; if (!key || !name_zh) return res.status(400).json({ message: "分類 Key 和中文名稱為必填項。" }); try { const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); const prompt = `Translate "${name_zh}" to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko". Example: {"en": "Main Course", "ja": "メイン", "ko": "메인 요리"}`; const result = await generateContentWithRetry(model, prompt); let name; if (result.success) { const jsonMatch = result.text.match(/\{[\s\S]*\}/); const jsonString = jsonMatch ? jsonMatch[0] : '{}'; const translated = JSON.parse(jsonString); name = { zh: name_zh, en: translated.en || name_zh, ja: translated.ja || name_zh, ko: translated.ko || name_zh }; } else { name = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh }; } const maxOrderResult = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM categories'); const newOrder = maxOrderResult.rows[0].max_order + 1; const insertResult = await pool.query('INSERT INTO categories (key, name, sort_order) VALUES ($1, $2, $3) RETURNING *', [key.toLowerCase().replace(/\s/g, '-'), name, newOrder]); res.status(201).json(insertResult.rows[0]); } catch (error) { console.error("新增分類時發生錯誤:", error); if (error.code === '23505') { return res.status(400).json({ message: `分類 Key "${key}" 已存在，請使用不同的 Key。` }); } res.status(500).json({ message: "新增分類失敗" }); } });
 app.put('/api/admin/categories/order', async (req, res) => { const { orderedIds } = req.body; if (!Array.isArray(orderedIds)) { return res.status(400).json({ message: '無效的資料格式，預期為 ID 陣列。' }); } const client = await pool.connect(); try { await client.query('BEGIN'); for (let i = 0; i < orderedIds.length; i++) { const id = parseInt(orderedIds[i], 10); if (isNaN(id)) { console.warn(`排序時發現無效的分類 ID: "${orderedIds[i]}"，已跳過。`); continue; } const sortOrder = i + 1; await client.query('UPDATE categories SET sort_order = $1 WHERE id = $2', [sortOrder, id]); } await client.query('COMMIT'); res.status(200).json({ message: '順序已更新' }); } catch (error) { await client.query('ROLLBACK'); console.error('更新分類順序時發生錯誤:', error); res.status(500).json({ message: `更新順序失敗: ${error.message}` }); } finally { client.release(); } });
-app.put('/api/admin/categories/:id', async (req, res) => { const { id } = req.params; const { key, name, name_zh } = req.body; let finalName = name; try { if (name_zh && (!name || name.zh !== name_zh)) { const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); const prompt = `Translate "${name_zh}" to English, Japanese, and Korean. Respond with ONLY a valid JSON object with keys "en", "ja", "ko".`; const result = await generateContentWithRetry(model, prompt); if (result.success) { const jsonMatch = result.text.match(/\{[\s\S]*\}/); const translated = JSON.parse(jsonMatch[0]); finalName = { zh: name_zh, en: translated.en || name_zh, ja: translated.ja || name_zh, ko: translated.ko || name_zh }; } else { finalName = { zh: name_zh, en: name_zh, ja: name_zh, ko: name_zh }; } } const dbResult = await pool.query('UPDATE categories SET key = $1, name = $2 WHERE id = $3 RETURNING *', [key, finalName, id]); res.json(dbResult.rows[0]); } catch (error) { console.error('更新分類時發生錯誤:', error); res.status(500).json({ message: "更新分類失敗" }); } });
+app.put('/api/admin/categories/:id', async (req, res) => { const { id } = req.params; const { key, name } = req.body; try { const result = await pool.query('UPDATE categories SET key = $1, name = $2 WHERE id = $3 RETURNING *', [key, name, id]); res.json(result.rows[0]); } catch (error) { console.error('更新分類時發生錯誤:', error); res.status(500).json({ message: "更新分類失敗" }); } });
 app.delete('/api/admin/categories/:id', async (req, res) => { const { id } = req.params; const client = await pool.connect(); try { await client.query('BEGIN'); const catResult = await client.query('SELECT key FROM categories WHERE id = $1', [id]); const catKey = catResult.rows[0]?.key; if (catKey) { await client.query('UPDATE menu_items SET category_key = NULL WHERE category_key = $1', [catKey]); } await client.query('DELETE FROM categories WHERE id = $1', [id]); await client.query('COMMIT'); res.status(204).send(); } catch (error) { await client.query('ROLLBACK'); res.status(500).json({ message: '刪除分類失敗' }); } finally { client.release(); } });
 
 // 菜單品項管理 API
