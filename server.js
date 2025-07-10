@@ -161,6 +161,8 @@ app.post('/api/admin/login', (req, res) => { const { password } = req.body; if (
 app.get('/api/admin/settings', async (req, res) => { try { const settingsResult = await pool.query('SELECT * FROM app_settings'); const settings = settingsResult.rows.reduce((acc, row) => { let value = row.setting_value; if (row.setting_key === 'transactionFeePercent') value = Number(value); if (['useLogo', 'isAiEnabled', 'saveToGoogleSheet', 'saveToDatabase'].includes(row.setting_key)) value = (value === 'true'); acc[row.setting_key] = value; return acc; }, {}); res.json(settings); } catch (err) { res.status(500).json({ message: '讀取設定錯誤' }); } });
 app.put('/api/admin/settings', async (req, res) => { const settingsToUpdate = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); for (const [key, value] of Object.entries(settingsToUpdate)) { const query = `INSERT INTO app_settings (setting_key, setting_value) VALUES ($1, $2) ON CONFLICT (setting_key) DO UPDATE SET setting_value = $2;`; await client.query(query, [key, String(value)]); } await client.query('COMMIT'); res.status(200).json({ message: '設定已更新' }); } catch (err) { await client.query('ROLLBACK'); console.error('更新設定時發生錯誤', err); res.status(500).json({ message: '更新設定時發生錯誤' }); } finally { client.release(); } });
 app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => { if (!req.file) return res.status(400).send('No file uploaded.'); if (!process.env.IMGBB_API_KEY) { return res.status(500).json({ message: '未設定 ImgBB API 金鑰' }); } try { const formData = new FormData(); formData.append('image', req.file.buffer.toString('base64')); const response = await axios.post(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`, formData); res.json({ imageUrl: response.data.data.url }); } catch (error) { console.error('ImgBB upload error:', error.response ? error.response.data : error.message); res.status(500).json({ message: '圖片上傳失敗' }); } });
+
+// 公告管理 API (CRUD)
 app.get('/api/admin/announcements', async (req, res) => { const result = await pool.query('SELECT * FROM announcements ORDER BY sort_order ASC'); res.json(result.rows); });
 app.post('/api/admin/announcements', async (req, res) => { const { image, text } = req.body; const result = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM announcements'); const newOrder = result.rows[0].max_order + 1; const insertResult = await pool.query('INSERT INTO announcements (image, text, sort_order) VALUES ($1, $2, $3) RETURNING *', [image, text, newOrder]); res.status(201).json(insertResult.rows[0]); });
 app.put('/api/admin/announcements/:id', async (req, res) => { const { id } = req.params; const { image, text } = req.body; const result = await pool.query('UPDATE announcements SET image = $1, text = $2 WHERE id = $3 RETURNING *', [image, text, id]); res.json(result.rows[0]); });
@@ -175,7 +177,6 @@ app.put('/api/admin/categories/:id', async (req, res) => { const { id } = req.pa
 // 【修正】分類排序 API，確保傳入的都是數字
 app.put('/api/admin/categories/order', async (req, res) => {
     const { orderedIds } = req.body;
-    console.log('後端收到的分類排序請求:', orderedIds);
     if (!Array.isArray(orderedIds)) {
         return res.status(400).json({ message: '無效的資料格式，預期為 ID 陣列。' });
     }
@@ -185,7 +186,8 @@ app.put('/api/admin/categories/order', async (req, res) => {
         for (let i = 0; i < orderedIds.length; i++) {
             const id = parseInt(orderedIds[i], 10);
             if (isNaN(id)) {
-                throw new Error(`無效的分類 ID: "${orderedIds[i]}"`);
+                console.warn(`排序時發現無效的分類 ID: "${orderedIds[i]}"，已跳過。`);
+                continue; // 跳過無效的 ID
             }
             const sortOrder = i + 1;
             await client.query('UPDATE categories SET sort_order = $1 WHERE id = $2', [sortOrder, id]);
